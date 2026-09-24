@@ -81,6 +81,95 @@ def obtener_datos(simbolo='BTC/USDT'):
     
     return df
 
+# =========================================================
+# 3. ESCUCHADOR DE COMANDOS EN TIEMPO REAL (/saldo, /estado)
+# =========================================================
+def escuchar_comandos_telegram():
+    """Escucha mensajes entrantes en Telegram y responde a /saldo, /estado, /ayuda."""
+    offset = None
+    print("[TELEGRAM] Escuchador de comandos interactivos activado...")
+    
+    while True:
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+            params = {"timeout": 20, "offset": offset}
+            res = requests.get(url, params=params, timeout=25).json()
+            
+            if "result" in res:
+                for update in res["result"]:
+                    offset = update["update_id"] + 1
+                    message = update.get("message", {})
+                    texto = message.get("text", "").strip().lower()
+                    chat_id_remitente = str(message.get("chat", {}).get("id", ""))
+
+                    # Seguridad: Responder únicamente si el mensaje proviene de tu CHAT_ID
+                    if chat_id_remitente != str(TELEGRAM_CHAT_ID):
+                        continue
+
+                    # Obtener datos actualizados para la respuesta
+                    try:
+                        df = obtener_datos('BTC/USDT')
+                        precio_actual = df.iloc[-1]['close']
+                        rsi_actual = df.iloc[-1]['rsi']
+                    except Exception:
+                        precio_actual = 0.0
+                        rsi_actual = 0.0
+
+                    # COMANDO: /saldo
+                    if texto.startswith("/saldo"):
+                        valor_actual_btc = btc_poseido * precio_actual
+                        valor_total = saldo_usdt + valor_actual_btc
+                        pnl = valor_total - 1000.0
+                        
+                        msg = (
+                            f"💼 <b>ESTADO DE TU CARTERA</b>\n\n"
+                            f"💵 <b>USDT Disponible:</b> ${saldo_usdt:,.2f}\n"
+                            f"🪙 <b>BTC en Cartera:</b> {btc_poseido:.6f} BTC\n"
+                            f"📊 <b>Valor Total Estimado:</b> ${valor_total:,.2f}\n"
+                            f"📈 <b>Ganancia/Pérdida Total:</b> ${pnl:+,.2f}"
+                        )
+                        enviar_telegram(msg)
+
+                    # COMANDO: /estado
+                    elif texto.startswith("/estado"):
+                        if en_posicion and precio_entrada > 0:
+                            pnl_pct = ((precio_actual - precio_entrada) / precio_entrada) * 100
+                            estado_pos = (
+                                f"🟢 <b>EN POSICIÓN (COMPRADO)</b>\n"
+                                f"• Precio entrada: ${precio_entrada:,.2f}\n"
+                                f"• Rendimiento actual: {pnl_pct:+.2f}%"
+                            )
+                        else:
+                            estado_pos = "⚪ <b>EN ESPERA (Sin posición abierta)</b>"
+
+                        msg = (
+                            f"🤖 <b>ESTADO DEL BOT Y MERCADO</b>\n\n"
+                            f"📍 <b>Par:</b> BTC/USDT\n"
+                            f"💰 <b>Precio Actual:</b> ${precio_actual:,.2f}\n"
+                            f"📊 <b>RSI (1h):</b> {rsi_actual:.1f}\n"
+                            f"📌 <b>Posición:</b>\n{estado_pos}"
+                        )
+                        enviar_telegram(msg)
+
+                    # COMANDO: /start O /ayuda
+                    elif texto.startswith("/start") or texto.startswith("/ayuda") or texto.startswith("/help"):
+                        msg = (
+                            f"👋 <b>¡Comandos disponibles del Bot!</b>\n\n"
+                            f"➡️ <b>/saldo</b> - Muestra tu saldo en USDT, BTC y ganancia/pérdida total\n"
+                            f"➡️ <b>/estado</b> - Muestra el precio actual de BTC, RSI y posición\n"
+                            f"➡️ <b>/ayuda</b> - Muestra este menú de ayuda"
+                        )
+                        enviar_telegram(msg)
+
+        except Exception as e:
+            print(f"[ERROR COMANDOS TELEGRAM]: {e}")
+            time.sleep(5)
+
+        time.sleep(1)
+
+# =========================================================
+# 4. ESTRATEGIA DE TRADING Y GESTIÓN DE RIESGO
+# =========================================================
 def ejecutar_estrategia():
     global saldo_usdt, btc_poseido, precio_entrada, en_posicion
     
@@ -177,26 +266,30 @@ def ejecutar_estrategia():
             saldo_usdt = 0.0
 
 # =========================================================
-# 3. BUCLE DE EJECUCIÓN
+# 5. BUCLE DE EJECUCIÓN PRINCIPAL
 # =========================================================
 if __name__ == '__main__':
     print("=== INICIANDO MOTOR DE TRADING CUANTITATIVO CON PAPER TRADING ===")
     
-    # 1. Iniciar servidor de Render
+    # 1. Iniciar servidor HTTP para Render
     server_thread = threading.Thread(target=run_dummy_server, daemon=True)
     server_thread.start()
 
-    # 2. Notificación inicial en Telegram
+    # 2. Iniciar escuchador de comandos de Telegram en segundo plano
+    telegram_thread = threading.Thread(target=escuchar_comandos_telegram, daemon=True)
+    telegram_thread.start()
+
+    # 3. Notificación inicial en Telegram
     enviar_telegram(
-        "🧠 <b>[MODO PAPER TRADING ACTIVADO]</b>\n\n"
+        "🧠 <b>[MODO PAPER TRADING ACTIVADO CON COMANDOS]</b>\n\n"
         "• <b>Capital Ficticio:</b> $1,000.00 USDT\n"
         "• <b>Stop Loss:</b> 2%\n"
         "• <b>Take Profit:</b> 4%\n"
         "• <b>Filtro RSI:</b> Sí (< 60)\n\n"
-        "<i>El bot analizará el mercado en silencio y te notificará únicamente al ejecutar operaciones.</i>"
+        "💬 <i>Escribe <b>/saldo</b> o <b>/estado</b> en este chat para consultar tu cuenta.</i>"
     )
     
-    # 3. Bucle de monitoreo continuo (revisa cada 5 minutos)
+    # 4. Bucle de monitoreo continuo (revisa cada 5 minutos)
     while True:
         try:
             ejecutar_estrategia()
