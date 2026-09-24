@@ -5,6 +5,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 import ccxt
 import pandas as pd
 import requests
+from datetime import datetime
 
 # =========================================================
 # CONFIGURACIÓN Y CREDENCIALES DE TELEGRAM
@@ -13,7 +14,7 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8628860776:AAEQHlVjzM1fXFhBPu
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "402919772")
 
 def enviar_telegram(mensaje: str):
-    """Envía una notificación en formato HTML a tu cuenta de Telegram."""
+    """Envía notificaciones a Telegram en formato HTML."""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -23,97 +24,183 @@ def enviar_telegram(mensaje: str):
     try:
         respuesta = requests.post(url, json=payload, timeout=10)
         if respuesta.status_code != 200:
-            print(f"[ERROR TELEGRAM]: Respuesta de API {respuesta.status_code} - {respuesta.text}")
+            print(f"[ERROR TELEGRAM]: Respuesta {respuesta.status_code} - {respuesta.text}")
     except Exception as e:
         print(f"[ERROR TELEGRAM]: Error de conexión: {e}")
 
 # =========================================================
-# 1. SERVIDOR HTTP PARA EL PLAN GRATUITO EN RENDER
+# 1. SERVIDOR HTTP PARA MANTENER RENDER ACTIVO
 # =========================================================
 class DummyHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        """Responde a las peticiones del verificador de estado de Render."""
         self.send_response(200)
         self.send_header('Content-type', 'text/html; charset=utf-8')
         self.end_headers()
-        self.wfile.write("🤖 Bot de Trading activo 24/7 en Render!".encode('utf-8'))
+        self.wfile.write("🤖 Bot de Trading cuantitativo activo en Render!".encode('utf-8'))
 
     def log_message(self, format, *args):
-        """Silencia las peticiones HTTP en consola para mantener los logs limpios."""
         return
 
 def run_dummy_server():
-    """Abre el puerto asignado por Render para mantener el Web Service activo."""
     port = int(os.environ.get("PORT", 8080))
     server = HTTPServer(('0.0.0.0', port), DummyHandler)
     print(f"[SERVIDOR] Servidor HTTP de Render listo en el puerto {port}")
     server.serve_forever()
 
 # =========================================================
-# 2. LÓGICA DE ANÁLISIS DE MERCADO
+# 2. ESTADO Y PARÁMETROS DE PAPER TRADING (SIMULACIÓN)
 # =========================================================
-# Conexión pública a Binance con control de frecuencia de peticiones
-exchange = ccxt.binance({
-    'enableRateLimit': True
-})
+STOP_LOSS_PCT = 0.02   # Protección: Máximo 2% de pérdida
+TAKE_PROFIT_PCT = 0.04  # Objetivo: 4% de ganancia
 
-ultima_tendencia = None
+# Cartera simulada inicial
+saldo_usdt = 1000.0
+btc_poseido = 0.0
+precio_entrada = 0.0
+en_posicion = False
 
-def analizar_mercado():
-    global ultima_tendencia
-    simbolo = 'BTC/USDT'
-    
-    # Descargar las últimas 30 velas de 1 hora
-    ohlcv = exchange.fetch_ohlcv(simbolo, timeframe='1h', limit=30)
+exchange = ccxt.binance({'enableRateLimit': True})
+
+def obtener_datos(simbolo='BTC/USDT'):
+    """Obtiene velas de 1 hora y calcula Medias Móviles y RSI."""
+    ohlcv = exchange.fetch_ohlcv(simbolo, timeframe='1h', limit=50)
     df = pd.DataFrame(ohlcv, columns=['tiempo', 'open', 'high', 'low', 'close', 'volume'])
-    df['tiempo'] = pd.to_datetime(df['tiempo'], unit='ms')
     
-    precio_actual = df['close'].iloc[-1]
-    
-    # Cálculo de medias móviles (Rápida 5 horas, Lenta 20 horas)
+    # Medias Móviles
     df['sma_rapida'] = df['close'].rolling(5).mean()
     df['sma_lenta'] = df['close'].rolling(20).mean()
     
-    sma_rapida_val = df['sma_rapida'].iloc[-1]
-    sma_lenta_val = df['sma_lenta'].iloc[-1]
+    # Cálculo del indicador RSI (14 periodos)
+    delta = df['close'].diff()
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+    avg_gain = gain.rolling(window=14).mean()
+    avg_loss = loss.rolling(window=14).mean()
+    rs = avg_gain / avg_loss
+    df['rsi'] = 100 - (100 / (1 + rs))
     
-    # Determinamos la tendencia actual
-    tendencia_actual = "ALCISTA 📈" if sma_rapida_val > sma_lenta_val else "BAJISTA / LATERAL 📉"
-    
-    fecha_hora = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
-    print(f"[{fecha_hora}] {simbolo} | Precio: ${precio_actual:,.2f} | SMA5: ${sma_rapida_val:,.2f} | SMA20: ${sma_lenta_val:,.2f}")
+    return df
 
-    # Preparamos el informe
-    mensaje = (
-        f"📊 <b>Informe del Bot de Trading</b>\n\n"
-        f"• <b>Activo:</b> {simbolo}\n"
-        f"• <b>Precio actual:</b> ${precio_actual:,.2f}\n"
-        f"• <b>Media Rápida (5h):</b> ${sma_rapida_val:,.2f}\n"
-        f"• <b>Media Lenta (20h):</b> ${sma_lenta_val:,.2f}\n"
-        f"• <b>Estado:</b> {tendencia_actual}\n\n"
-        f"🤖 <i>Servidor activo 24/7 en Render ({fecha_hora})</i>"
-    )
+def ejecutar_estrategia():
+    global saldo_usdt, btc_poseido, precio_entrada, en_posicion
     
-    enviar_telegram(mensaje)
+    simbolo = 'BTC/USDT'
+    df = obtener_datos(simbolo)
+    
+    actual = df.iloc[-1]
+    anterior = df.iloc[-2]
+    precio_actual = actual['close']
+    rsi_actual = actual['rsi']
+    
+    fecha_hora = datetime.now().strftime('%d/%m/%Y %H:%M:%S')
+    print(f"[{fecha_hora}] {simbolo} | Precio: ${precio_actual:,.2f} | RSI: {rsi_actual:.1f} | Saldo Simulado: ${saldo_usdt:,.2f}")
+
+    # ---------------------------------------------------------
+    # CASO A: TENEMOS UNA POSICIÓN ABIERTA (Gestionar Riesgo)
+    # ---------------------------------------------------------
+    if en_posicion:
+        rendimiento = (precio_actual - precio_entrada) / precio_entrada
+        var_pct = rendimiento * 100
+        
+        # 1. STOP LOSS ALCANZADO (-2%)
+        if rendimiento <= -STOP_LOSS_PCT:
+            saldo_usdt = btc_poseido * precio_actual
+            msg = (
+                f"🛡️ <b>[STOP LOSS EJECUTADO]</b>\n\n"
+                f"• <b>Activo:</b> {simbolo}\n"
+                f"• <b>Precio Venta:</b> ${precio_actual:,.2f}\n"
+                f"• <b>Pérdida recortada:</b> {var_pct:.2f}%\n"
+                f"💰 <b>Nuevo Saldo Total:</b> ${saldo_usdt:,.2f} USDT"
+            )
+            print(f"[VENTA - STOP LOSS] {msg}")
+            enviar_telegram(msg)
+            en_posicion = False
+            btc_poseido = 0.0
+
+        # 2. TAKE PROFIT ALCANZADO (+4%)
+        elif rendimiento >= TAKE_PROFIT_PCT:
+            saldo_usdt = btc_poseido * precio_actual
+            msg = (
+                f"🎯 <b>[TAKE PROFIT ALCANZADO]</b>\n\n"
+                f"• <b>Activo:</b> {simbolo}\n"
+                f"• <b>Precio Venta:</b> ${precio_actual:,.2f}\n"
+                f"• <b>Ganancia Asegurada:</b> +{var_pct:.2f}%\n"
+                f"💰 <b>Nuevo Saldo Total:</b> ${saldo_usdt:,.2f} USDT"
+            )
+            print(f"[VENTA - TAKE PROFIT] {msg}")
+            enviar_telegram(msg)
+            en_posicion = False
+            btc_poseido = 0.0
+
+        # 3. VENTA TÉCNICA (Cruce Bajista de Medias)
+        elif anterior['sma_rapida'] >= anterior['sma_lenta'] and actual['sma_rapida'] < actual['sma_lenta']:
+            saldo_usdt = btc_poseido * precio_actual
+            msg = (
+                f"🔴 <b>[VENTA TÉCNICA - CRUCE BAJISTA]</b>\n\n"
+                f"• <b>Activo:</b> {simbolo}\n"
+                f"• <b>Precio Venta:</b> ${precio_actual:,.2f}\n"
+                f"• <b>Resultado Operación:</b> {var_pct:+.2f}%\n"
+                f"💰 <b>Nuevo Saldo Total:</b> ${saldo_usdt:,.2f} USDT"
+            )
+            print(f"[VENTA TÉCNICA] {msg}")
+            enviar_telegram(msg)
+            en_posicion = False
+            btc_poseido = 0.0
+
+    # ---------------------------------------------------------
+    # CASO B: NO TENEMOS POSICIÓN (Buscar Oportunidad de Compra)
+    # ---------------------------------------------------------
+    else:
+        cruce_alcista = (anterior['sma_rapida'] <= anterior['sma_lenta']) and (actual['sma_rapida'] > actual['sma_lenta'])
+        rsi_favorable = rsi_actual < 60  # Evita comprar sobrecalentado
+        
+        if cruce_alcista and rsi_favorable:
+            btc_poseido = saldo_usdt / precio_actual
+            precio_entrada = precio_actual
+            
+            sl_precio = precio_entrada * (1 - STOP_LOSS_PCT)
+            tp_precio = precio_entrada * (1 + TAKE_PROFIT_PCT)
+            
+            msg = (
+                f"🟢 <b>[COMPRA SIMULADA EJECUTADA]</b>\n\n"
+                f"• <b>Activo:</b> {simbolo}\n"
+                f"• <b>Precio Compra:</b> ${precio_actual:,.2f}\n"
+                f"• <b>Cantidad:</b> {btc_poseido:.6f} BTC\n"
+                f"• <b>RSI Actual:</b> {rsi_actual:.1f}\n"
+                f"-----------------------------------\n"
+                f"🛡️ <b>Stop Loss (-2%):</b> ${sl_precio:,.2f}\n"
+                f"🎯 <b>Take Profit (+4%):</b> ${tp_precio:,.2f}"
+            )
+            print(f"[COMPRA] {msg}")
+            enviar_telegram(msg)
+            en_posicion = True
+            saldo_usdt = 0.0
 
 # =========================================================
-# 3. BUCLE PRINCIPAL DE EJECUCIÓN 24/7
+# 3. BUCLE DE EJECUCIÓN
 # =========================================================
 if __name__ == '__main__':
-    print("=== INICIANDO BOT DE TRADING CON CONEXIÓN A TELEGRAM Y RENDER ===")
+    print("=== INICIANDO MOTOR DE TRADING CUANTITATIVO CON PAPER TRADING ===")
     
-    # 1. Iniciar el servidor web de Render en segundo plano
+    # 1. Iniciar servidor de Render
     server_thread = threading.Thread(target=run_dummy_server, daemon=True)
     server_thread.start()
 
-    # 2. Enviar mensaje de bienvenida al encender el bot
-    enviar_telegram("🚀 <b>¡Bot encendido correctamente en Render!</b>\nTu servidor está listo y enviará informes periódicos cada 15 minutos.")
+    # 2. Notificación inicial en Telegram
+    enviar_telegram(
+        "🧠 <b>[MODO PAPER TRADING ACTIVADO]</b>\n\n"
+        "• <b>Capital Ficticio:</b> $1,000.00 USDT\n"
+        "• <b>Stop Loss:</b> 2%\n"
+        "• <b>Take Profit:</b> 4%\n"
+        "• <b>Filtro RSI:</b> Sí (< 60)\n\n"
+        "<i>El bot analizará el mercado en silencio y te notificará únicamente al ejecutar operaciones.</i>"
+    )
     
-    # 3. Bucle automático de análisis cada 15 minutos
+    # 3. Bucle de monitoreo continuo (revisa cada 5 minutos)
     while True:
         try:
-            analizar_mercado()
-            time.sleep(900)  # Revisa cada 15 minutos (900 segundos)
+            ejecutar_estrategia()
+            time.sleep(300)  # Revisa el mercado cada 5 minutos (300 segundos)
         except Exception as e:
-            print(f"[ERROR]: Ocurrió un fallo en la ejecución: {e}")
-            time.sleep(60)  # Reintenta en 1 minuto en caso de error
+            print(f"[ERROR EN BUCLE]: {e}")
+            time.sleep(30)
