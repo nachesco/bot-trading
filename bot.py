@@ -9,8 +9,8 @@ import requests
 from datetime import datetime
 
 # Las claves ahora se leen de forma segura desde Render
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8890611356:AAFjh56u6yPL6xyfIdIzxMTH1TyCRepRlUk")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "402919772")
 
 # =========================================================
 # 1. SERVIDOR HTTP PARA MANTENER RENDER ACTIVO
