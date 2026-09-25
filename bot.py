@@ -1,3 +1,21 @@
+import os
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+# Servidor web interno para que Render mantenga el bot activo gratis
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot OK")
+
+def run_health_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    server.serve_forever()
+
+# Inicia el servidor en segundo plano
+threading.Thread(target=run_health_server, daemon=True).start()
 import ccxt
 import pandas as pd
 import requests
@@ -209,5 +227,5 @@ if __name__ == '__main__':
             analizar_y_operar('BTC/USDT')
             time.sleep(900)
         except Exception as e:
-            print(f"Error durante la ejecución: {e}")
-            time.sleep(60)
+            print(f"[ERROR EN BUCLE]: {e}")
+            time.sleep(30)
