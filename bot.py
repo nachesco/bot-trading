@@ -2,6 +2,25 @@ import ccxt
 import pandas as pd
 import requests
 import time
+import os
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+# Servidor web ligero para satisfacer a Render.com
+class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot de Trading activo")
+
+def start_health_check_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(('0.0.0.0', port), SimpleHTTPRequestHandler)
+    print(f"Servidor web de salud iniciado en el puerto {port}")
+    server.serve_forever()
+
+# Iniciar el servidor web en un hilo secundario sin bloquear el bot
+threading.Thread(target=start_health_check_server, daemon=True).start()
 
 # --- CONFIGURACIÓN DE TELEGRAM ---
 TOKEN = "8628860776:AAFcmxMmxmdVmPy8EAWC--iP0mXCtEG2MLk"  # Reemplaza por tu Token de @BotFather
