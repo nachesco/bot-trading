@@ -41,7 +41,7 @@ def start_health_check_server():
 threading.Thread(target=start_health_check_server, daemon=True).start()
 
 # --- CONFIGURACIÓN DE TELEGRAM ---
-TOKEN = "8628860776:AAFcmxMmxmdVmPy8EAWC--iP0mXCtEG2MLk"  # Reemplaza por tu Token de @BotFather
+TOKEN = "88628860776:AAE5I29ZKaNQHdxbNwynFXfWiB3HoN9XtAo"  # Reemplaza por tu Token de @BotFather
 CHAT_ID = "402919772"
 
 # --- CONFIGURACIÓN DE RIESGO Y ESTRATEGIA ---
