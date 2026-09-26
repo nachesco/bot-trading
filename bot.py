@@ -1,172 +1,157 @@
 import os
 import time
-import logging
 import threading
-from flask import Flask
-import requests
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import ccxt
+import pandas as pd
+from datetime import datetime
 
-# ---------------------------------------------------------------------------
-# CONFIGURACIÓN Y CREDENCIALES
-# ---------------------------------------------------------------------------
-TELEGRAM_TOKEN = '8628860776:AAE5I29ZKaNQHdxbNwynFXfWiB3HoN9XtAo'
-TELEGRAM_CHAT_ID = '402919772'
+# =========================================================
+# 1. ESTADO GLOBAL (Para mostrarlo en la web)
+# =========================================================
+registro_actividad = "🤖 Bot iniciado. Esperando el primer análisis de mercado..."
 
-# Configuración de logs en consola
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+# =========================================================
+# 2. SERVIDOR HTTP (Mantiene Render vivo y te muestra datos)
+# =========================================================
+class WebHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/html; charset=utf-8')
+        self.end_headers()
+        
+        # Esta es la página web que verás al entrar a tu enlace de Render
+        html = f"""
+        <html>
+        <head>
+            <title>Mi Bot de Trading</title>
+            <meta http-equiv="refresh" content="30"> <!-- Se actualiza solo cada 30 seg -->
+        </head>
+        <body style="font-family: monospace; padding: 20px; background-color: #1e1e1e; color: #00ff00;">
+            <h2>📊 Panel de Paper Trading</h2>
+            <hr>
+            <pre style="font-size: 16px;">{registro_actividad}</pre>
+        </body>
+        </html>
+        """
+        self.wfile.write(html.encode('utf-8'))
 
-# ---------------------------------------------------------------------------
-# SERVIDOR HTTP (FLASK) PARA MANTENER RENDER ACTIVO 24/7
-# ---------------------------------------------------------------------------
-app = Flask(__name__)
+    def log_message(self, format, *args):
+        pass # Silenciamos los logs del servidor para no manchar la consola
 
-@app.route('/')
-def home():
-    return "Bot de Trading activo y ejecutándose en Render 24/7.", 200
+def run_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(('0.0.0.0', port), WebHandler)
+    print(f"[SERVIDOR] Panel web listo en el puerto {port}")
+    server.serve_forever()
 
-@app.route('/health')
-def health():
-    return "OK", 200
+# =========================================================
+# 3. PARÁMETROS DE PAPER TRADING
+# =========================================================
+STOP_LOSS_PCT = 0.02
+TAKE_PROFIT_PCT = 0.04
 
-def run_flask():
-    port = int(os.environ.get('PORT', 10000))
-    app.run(host='0.0.0.0', port=port)
+saldo_usdt = 1000.0
+btc_poseido = 0.0
+precio_entrada = 0.0
+en_posicion = False
 
-# ---------------------------------------------------------------------------
-# FUNCIONES AUXILIARES DE PRECIOS (SIN BLOQUEOS EN RENDER)
-# ---------------------------------------------------------------------------
-def enviar_mensaje_telegram(texto: str):
-    """Envía un mensaje directo a Telegram mediante la API de Bot."""
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": texto,
-        "parse_mode": "Markdown"
-    }
-    try:
-        requests.post(url, json=payload, timeout=10)
-    except Exception as e:
-        logger.error(f"Error enviando mensaje a Telegram: {e}")
+exchange = ccxt.binance({'enableRateLimit': True})
 
-def obtener_precio_btc():
-    """Obtiene el precio de Bitcoin usando Coinbase (permite IPs de servidores cloud)."""
-    try:
-        # API pública de Coinbase Pro / Exchange
-        url = "https://api.exchange.coinbase.com/products/BTC-USD/ticker"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        response = requests.get(url, headers=headers, timeout=5)
-        if response.status_code == 200:
-            data = response.json()
-            return {
-                "precio": float(data['price']),
-                "fuente": "Coinbase"
-            }
-    except Exception as e:
-        logger.warning(f"Fallo Coinbase API ({e}), usando respaldo CoinGecko...")
-
-    try:
-        # Respaldo con CoinGecko
-        url_cg = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd"
-        response = requests.get(url_cg, timeout=5)
-        if response.status_code == 200:
-            data = response.json().get('bitcoin', {})
-            return {
-                "precio": float(data.get('usd', 0)),
-                "fuente": "CoinGecko"
-            }
-    except Exception as e:
-        logger.error(f"Error en CoinGecko: {e}")
-
-    return None
-
-def generar_informe_estado():
-    """Genera un informe del mercado actual."""
-    datos = obtener_precio_btc()
-    if datos is None:
-        return "❌ Error al conectar con los servidores de mercado."
+def obtener_datos(simbolo='BTC/USDT'):
+    ohlcv = exchange.fetch_ohlcv(simbolo, timeframe='1h', limit=50)
+    df = pd.DataFrame(ohlcv, columns=['tiempo', 'open', 'high', 'low', 'close', 'volume'])
+    df['sma_rapida'] = df['close'].rolling(5).mean()
+    df['sma_lenta'] = df['close'].rolling(20).mean()
     
-    precio = datos["precio"]
-    fuente = datos["fuente"]
+    delta = df['close'].diff()
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+    avg_gain = gain.rolling(window=14).mean()
+    avg_loss = loss.rolling(window=14).mean()
+    rs = avg_gain / avg_loss
+    df['rsi'] = 100 - (100 / (1 + rs))
+    return df
 
-    mensaje = (
-        f"📊 **Estado del Mercado - BTC/USD**\n\n"
-        f"• **Precio Actual:** ${precio:,.2f}\n"
-        f"• **Fuente de datos:** {fuente}\n\n"
-        f"🟢 *Servidor Render respondiendo correctamente sin bloqueos.*"
-    )
-    return mensaje
+def ejecutar_estrategia():
+    global saldo_usdt, btc_poseido, precio_entrada, en_posicion, registro_actividad
+    
+    simbolo = 'BTC/USDT'
+    df = obtener_datos(simbolo)
+    
+    actual = df.iloc[-1]
+    anterior = df.iloc[-2]
+    precio_actual = actual['close']
+    rsi_actual = actual['rsi']
+    
+    fecha_hora = datetime.now().strftime('%d/%m/%Y %H:%M:%S')
+    
+    # Actualizamos lo que se ve en la consola y en la web
+    estado_actual = f"[{fecha_hora}] {simbolo} | Precio: ${precio_actual:,.2f} | RSI: {rsi_actual:.1f} | Saldo: ${saldo_usdt:,.2f}"
+    print(estado_actual)
+    registro_actividad = estado_actual + "\n\nÚLTIMA ACCIÓN:\n"
 
-# ---------------------------------------------------------------------------
-# BUCLE DE COMANDOS DE TELEGRAM
-# ---------------------------------------------------------------------------
-def procesar_actualizaciones_telegram():
-    """Bucle principal para escuchar y responder comandos en Telegram."""
-    last_update_id = 0
-    url_get_updates = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+    if en_posicion:
+        rendimiento = (precio_actual - precio_entrada) / precio_entrada
+        var_pct = rendimiento * 100
+        
+        if rendimiento <= -STOP_LOSS_PCT:
+            saldo_usdt = btc_poseido * precio_actual
+            msg = f"🛑 [STOP LOSS] Venta a ${precio_actual:,.2f} ({var_pct:.2f}%). Saldo: ${saldo_usdt:,.2f}"
+            print(msg)
+            registro_actividad += msg
+            en_posicion = False
+            btc_poseido = 0.0
+
+        elif rendimiento >= TAKE_PROFIT_PCT:
+            saldo_usdt = btc_poseido * precio_actual
+            msg = f"🎯 [TAKE PROFIT] Venta a ${precio_actual:,.2f} (+{var_pct:.2f}%). Saldo: ${saldo_usdt:,.2f}"
+            print(msg)
+            registro_actividad += msg
+            en_posicion = False
+            btc_poseido = 0.0
+
+        elif anterior['sma_rapida'] >= anterior['sma_lenta'] and actual['sma_rapida'] < actual['sma_lenta']:
+            saldo_usdt = btc_poseido * precio_actual
+            msg = f"📉 [VENTA TÉCNICA] Venta a ${precio_actual:,.2f} ({var_pct:+.2f}%). Saldo: ${saldo_usdt:,.2f}"
+            print(msg)
+            registro_actividad += msg
+            en_posicion = False
+            btc_poseido = 0.0
+        else:
+            registro_actividad += f"Manteniendo posición. Rendimiento actual: {var_pct:+.2f}%"
+
+    else:
+        cruce_alcista = (anterior['sma_rapida'] <= anterior['sma_lenta']) and (actual['sma_rapida'] > actual['sma_lenta'])
+        rsi_favorable = rsi_actual < 60
+        
+        if cruce_alcista and rsi_favorable:
+            btc_poseido = saldo_usdt / precio_actual
+            precio_entrada = precio_actual
+            
+            msg = f"🟢 [COMPRA] {btc_poseido:.4f} BTC a ${precio_actual:,.2f}. SL: -2%, TP: +4%"
+            print(msg)
+            registro_actividad += msg
+            en_posicion = True
+            saldo_usdt = 0.0
+        else:
+            registro_actividad += "Buscando oportunidad de compra (Esperando cruce alcista y RSI < 60)..."
+
+# =========================================================
+# 4. BUCLE PRINCIPAL
+# =========================================================
+if __name__ == '__main__':
+    print("=== MODO PAPER TRADING INICIADO (SIN TELEGRAM) ===")
     
-    logger.info("Iniciando escucha de comandos de Telegram...")
-    
+    server_thread = threading.Thread(target=run_server, daemon=True)
+    server_thread.start()
+
     while True:
         try:
-            params = {"offset": last_update_id + 1, "timeout": 30}
-            response = requests.get(url_get_updates, params=params, timeout=35)
-            
-            if response.status_code == 200:
-                data = response.json()
-                for result in data.get("result", []):
-                    last_update_id = result["update_id"]
-                    
-                    message = result.get("message", {})
-                    text = message.get("text", "")
-                    chat_id = str(message.get("chat", {}).get("id", ""))
-                    
-                    if chat_id == TELEGRAM_CHAT_ID:
-                        if text in ['/start', '/help']:
-                            msg = (
-                                "🤖 **Bot de Trading Activo**\n\n"
-                                "Comandos disponibles:\n"
-                                "• `/estado` - Estado del mercado\n"
-                                "• `/saldo` - Resumen de saldo\n"
-                                "• `/btc` - Precio rápido de Bitcoin"
-                            )
-                            enviar_mensaje_telegram(msg)
-                            
-                        elif text in ['/estado', '/status']:
-                            informe = generar_informe_estado()
-                            enviar_mensaje_telegram(informe)
-                            
-                        elif text == '/saldo':
-                            msg = (
-                                "💰 **Resumen de Cuenta (Modo Simulación)**\n\n"
-                                "• **USDT disponible:** $1,000.00\n"
-                                "• **BTC invertido:** 0.00 BTC\n"
-                                "• **Valor Total:** $1,000.00"
-                            )
-                            enviar_mensaje_telegram(msg)
-                            
-                        elif text == '/btc':
-                            datos = obtener_precio_btc()
-                            if datos:
-                                enviar_mensaje_telegram(f"🪙 **BTC/USD:** ${datos['precio']:,.2f}")
-                            else:
-                                enviar_mensaje_telegram("❌ Error al consultar precio.")
-                                
+            ejecutar_estrategia()
+            time.sleep(300) # Analiza cada 5 minutos
         except Exception as e:
-            logger.error(f"Error en bucle de Telegram: {e}")
-            time.sleep(5)
-            
-        time.sleep(1)
-
-# ---------------------------------------------------------------------------
-# PUNTO DE ENTRADA PRINCIPAL
-# ---------------------------------------------------------------------------
-if __name__ == '__main__':
-    flask_thread = threading.Thread(target=run_flask)
-    flask_thread.daemon = True
-    flask_thread.start()
-    
-    enviar_mensaje_telegram("🚀 **¡Bot migrado a Coinbase!** Cero bloqueos geográficos.")
-    procesar_actualizaciones_telegram()
+            error_msg = f"[ERROR]: {e}"
+            print(error_msg)
+            registro_actividad = error_msg
+            time.sleep(30)
