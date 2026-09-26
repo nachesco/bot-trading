@@ -87,8 +87,9 @@ def enviar_telegram(mensaje, chat_id=None):
 # ------------------------------------------------------------------
 def obtener_analisis_tecnico():
     try:
-        exchange = ccxt.binance()
-        velas = exchange.fetch_ohlcv(SYMBOL, timeframe=TIMEFRAME, limit=300)
+        # Usamos Coinbase para evitar el bloqueo 451 de Binance en centros de datos
+        exchange = ccxt.coinbase()
+        velas = exchange.fetch_ohlcv('BTC/USD', timeframe='4h', limit=300)
         df = pd.DataFrame(velas, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         
         # Indicadores: EMAs y SMA 200
@@ -132,7 +133,7 @@ def obtener_analisis_tecnico():
         anterior = df.iloc[-2]
         return actual, anterior
     except Exception as e:
-        logging.error(f"Error obteniendo datos de Binance: {e}")
+        logging.error(f"Error obteniendo datos del mercado: {e}")
         return None, None
 
 # ------------------------------------------------------------------
