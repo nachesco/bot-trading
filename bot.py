@@ -56,7 +56,7 @@ btc_poseido = 0.0
 precio_entrada = 0.0
 en_posicion = False
 
-exchange = ccxt.binance({'enableRateLimit': True})
+exchange = ccxt.kucoin({'enableRateLimit': True})
 
 def obtener_datos(simbolo='BTC/USDT'):
     ohlcv = exchange.fetch_ohlcv(simbolo, timeframe='1h', limit=50)
