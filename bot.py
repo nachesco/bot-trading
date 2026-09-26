@@ -87,8 +87,8 @@ def enviar_telegram(mensaje, chat_id=None):
 # ------------------------------------------------------------------
 def obtener_analisis_tecnico():
     try:
-        # Usamos Coinbase para evitar el bloqueo 451 de Binance en centros de datos
-        exchange = ccxt.coinbase()
+        # Usamos Kraken: admite timeframe '4h' nativo y no tiene bloqueos IP en Render
+        exchange = ccxt.kraken()
         velas = exchange.fetch_ohlcv('BTC/USD', timeframe='4h', limit=300)
         df = pd.DataFrame(velas, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         
