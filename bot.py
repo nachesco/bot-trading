@@ -52,11 +52,15 @@ exchange = ccxt.kraken({'enableRateLimit': True})
 
 def obtener_datos(simbolo='BTC/USD'):
     try:
-        ohlcv = exchange.fetch_ohlcv(simbolo, timeframe='4h', limit=50)
+        # Cambiamos timeframe='4h' por timeframe='15m' (o '5m' si quieres máxima velocidad)
+        ohlcv = exchange.fetch_ohlcv(simbolo, timeframe='15m', limit=50)
         df = pd.DataFrame(ohlcv, columns=['tiempo', 'open', 'high', 'low', 'close', 'volume'])
-        df['sma_rapida'] = df['close'].rolling(5).mean()
-        df['sma_lenta'] = df['close'].rolling(20).mean()
         
+        # Medias móviles más cortas para mayor reactividad (3 y 10)
+        df['sma_rapida'] = df['close'].rolling(3).mean()
+        df['sma_lenta'] = df['close'].rolling(10).mean()
+        
+        # Indicador RSI
         delta = df['close'].diff()
         gain = delta.where(delta > 0, 0)
         loss = -delta.where(delta < 0, 0)
@@ -277,13 +281,14 @@ def ejecutar_estrategia():
 # =========================================================
 # ARRANQUE PRINCIPAL
 # =========================================================
+# Al final del archivo bot.py:
 if __name__ == '__main__':
     threading.Thread(target=run_web_server, daemon=True).start()
-    print("🧠 Bot iniciado sin dependencias de Telegram.")
+    print("🧠 Bot iniciado en modo Alta Frecuencia (15m).")
     
     while True:
         try:
             ejecutar_estrategia()
         except Exception as e:
             print(f"[ERROR BUCLE]: {e}")
-        time.sleep(300)
+        time.sleep(60)  # Revisa cada 60 segundos en vez de 300
