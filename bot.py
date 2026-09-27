@@ -48,7 +48,7 @@ def registrar_evento(estado, texto):
     historial.insert(0, linea)
     estado['historial'] = historial[:10]
     
-    # EL SECRETO PARA RENDER: flush=True fuerza a imprimir en el log al instante
+    # flush=True fuerza a imprimir en el log de Render al instante
     print(linea, flush=True)
 
 # --- PANEL WEB INTERACTIVO ---
@@ -104,8 +104,11 @@ def run_server():
 # --- LÓGICA DE TRADING ---
 def analizar_y_operar():
     estado = obtener_estado()
-    exchange = ccxt.binance()
     
+    # ⚠️ SOLUCIÓN AL ERROR 451: Usamos Kraken, que no bloquea a los servidores cloud
+    exchange = ccxt.kraken()
+    
+    # Obtenemos las velas de Kraken usando el mismo formato que ya tenías
     ohlcv = exchange.fetch_ohlcv('BTC/USDT', timeframe='15m', limit=50)
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['sma_20'] = df['close'].rolling(20).mean()
@@ -158,13 +161,13 @@ def analizar_y_operar():
 def bucle_trading():
     """Esta función mantiene vivo al bot en segundo plano"""
     print("🚀 [HILO BOT] Iniciando comprobaciones de mercado...", flush=True)
-    time.sleep(5) # Espera 5 segundos para asegurar que el panel web se enciende antes
+    time.sleep(5) 
     while True:
         try:
             analizar_y_operar()
         except Exception as e:
             print(f"❌ Error en bucle principal: {e}", flush=True)
-        # Espera 5 minutos (300 segundos) entre consultas a Binance
+        # Espera 5 minutos (300 segundos) entre consultas
         time.sleep(300)
 
 if __name__ == '__main__':
@@ -173,10 +176,8 @@ if __name__ == '__main__':
     else:
         print("=== BOT INICIADO ===", flush=True)
         
-        # 1. Metemos tu bot en un hilo secundario fantasma (daemon)
         hilo_bot = threading.Thread(target=bucle_trading)
         hilo_bot.daemon = True
         hilo_bot.start()
         
-        # 2. Dejamos el panel web (HTTPServer) en el hilo principal
         run_server()
