@@ -18,7 +18,7 @@ if MONGO_URI:
     db = cliente_mongo['trading_bot']
     coleccion_estado = db['estado']
 else:
-    print("⚠️ ADVERTENCIA: No se encontró MONGO_URI en las variables de Render.")
+    print("⚠️ ADVERTENCIA: No se encontró MONGO_URI en las variables de Render.", flush=True)
 
 def obtener_estado():
     """Lee el estado de la base de datos o lo crea si es la primera ejecución."""
@@ -40,7 +40,7 @@ def guardar_estado(estado):
     coleccion_estado.update_one({"_id": "estado_actual"}, {"$set": estado})
 
 def registrar_evento(estado, texto):
-    """Añade un registro al historial (guarda las últimas 10 acciones)."""
+    """Añade un registro al historial y lo imprime en los logs de Render."""
     fecha_hora = datetime.now().strftime('%d/%m/%Y %H:%M:%S')
     linea = f"[{fecha_hora}] {texto}"
     
@@ -48,7 +48,8 @@ def registrar_evento(estado, texto):
     historial.insert(0, linea)
     estado['historial'] = historial[:10]
     
-    print(linea)
+    # EL SECRETO PARA RENDER: flush=True fuerza a imprimir en el log al instante
+    print(linea, flush=True)
 
 # --- PANEL WEB INTERACTIVO ---
 class WebHandler(BaseHTTPRequestHandler):
@@ -95,7 +96,8 @@ class WebHandler(BaseHTTPRequestHandler):
         pass
 
 def run_server():
-    port = int(os.environ.get("PORT", 8080))
+    port = int(os.environ.get("PORT", 10000))
+    print(f"🌐 [HILO WEB] Arrancando panel de control en el puerto {port}...", flush=True)
     server = HTTPServer(('0.0.0.0', port), WebHandler)
     server.serve_forever()
 
@@ -153,16 +155,28 @@ def analizar_y_operar():
 
     guardar_estado(estado)
 
+def bucle_trading():
+    """Esta función mantiene vivo al bot en segundo plano"""
+    print("🚀 [HILO BOT] Iniciando comprobaciones de mercado...", flush=True)
+    time.sleep(5) # Espera 5 segundos para asegurar que el panel web se enciende antes
+    while True:
+        try:
+            analizar_y_operar()
+        except Exception as e:
+            print(f"❌ Error en bucle principal: {e}", flush=True)
+        # Espera 5 minutos (300 segundos) entre consultas a Binance
+        time.sleep(300)
+
 if __name__ == '__main__':
     if not MONGO_URI:
-        print("Error crítico: Falta MONGO_URI en Render.")
+        print("❌ Error crítico: Falta MONGO_URI en Render.", flush=True)
     else:
-        print("=== BOT INICIADO (Modo Web Dashboard Activo) ===")
-        threading.Thread(target=run_server, daemon=True).start()
+        print("=== BOT INICIADO ===", flush=True)
         
-        while True:
-            try:
-                analizar_y_operar()
-            except Exception as e:
-                print(f"Error en bucle principal: {e}")
-            time.sleep(300)
+        # 1. Metemos tu bot en un hilo secundario fantasma (daemon)
+        hilo_bot = threading.Thread(target=bucle_trading)
+        hilo_bot.daemon = True
+        hilo_bot.start()
+        
+        # 2. Dejamos el panel web (HTTPServer) en el hilo principal
+        run_server()
