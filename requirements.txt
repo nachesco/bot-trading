@@ -1,3 +1,5 @@
-ccxt==4.2.19
-pandas==2.2.0
-pymongo[srv]==4.6.2
+ccxt
+pandas
+requests
+flask
+pymongo[srv]
