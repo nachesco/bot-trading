@@ -1,327 +1,289 @@
 import os
 import time
-import json
-import logging
 import threading
-from flask import Flask
+import json
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import ccxt
 import pandas as pd
 import requests
+from datetime import datetime
 
-# ------------------------------------------------------------------
-# CONFIGURACIÓN Y LOGS
-# ------------------------------------------------------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# =========================================================
+# CONFIGURACIÓN Y ESTADO DEL BOT
+# =========================================================
+ARCHIVO_ESTADO = "estado_trading.json"
+STOP_LOSS_PCT = 0.02
+TAKE_PROFIT_PCT = 0.04
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "TU_TELEGRAM_TOKEN_AQUI")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")  # Se auto-guardará con el comando /start
+saldo_usd = 1000.0
+btc_poseido = 0.0
+precio_entrada = 0.0
+en_posicion = False
+historial_operaciones = []
 
-ESTADO_FILE = "paper_trading.json"
+# Cargar estado guardado si existe
+if os.path.exists(ARCHIVO_ESTADO):
+    try:
+        with open(ARCHIVO_ESTADO, "r") as f:
+            estado = json.load(f)
+            saldo_usd = estado.get("saldo_usd", 1000.0)
+            btc_poseido = estado.get("btc_poseido", 0.0)
+            precio_entrada = estado.get("precio_entrada", 0.0)
+            en_posicion = estado.get("en_posicion", False)
+            historial_operaciones = estado.get("historial_operaciones", [])
+    except Exception as e:
+        print(f"[ERROR CARGANDO ESTADO]: {e}")
 
-# Parámetros Estrategia V5
-SYMBOL = "BTC/USDT"
-TIMEFRAME = "4h"
-TAKE_PROFIT_PCT = 5.0
-STOP_LOSS_INICIAL_PCT = 3.5
-TRAILING_STOP_DIST_PCT = 2.0
-ADX_MINIMO = 22.0
-COMISION = 0.001  # 0.1% Binance
-
-# ------------------------------------------------------------------
-# SERVIDOR FLASK (Requerido por Render)
-# ------------------------------------------------------------------
-app = Flask(__name__)
-
-@app.route('/')
-def home():
-    return "Bot de Trading V5 (Paper Trading) activo y ejecutándose 24/7.", 200
-
-# ------------------------------------------------------------------
-# GESTIÓN DE ESTADO (PAPER TRADING)
-# ------------------------------------------------------------------
-def cargar_estado():
-    if os.path.exists(ESTADO_FILE):
-        try:
-            with open(ESTADO_FILE, "r") as f:
-                return json.load(f)
-        except Exception as e:
-            logging.error(f"Error cargando {ESTADO_FILE}: {e}")
-    
-    # Estado inicial por defecto
-    return {
-        "saldo_usdt": 1000.0,
-        "btc_comprado": 0.0,
-        "en_posicion": False,
-        "precio_compra": 0.0,
-        "max_precio_alcanzado": 0.0,
-        "chat_id": TELEGRAM_CHAT_ID,
-        "historial": []
+def guardar_estado():
+    estado = {
+        "saldo_usd": saldo_usd,
+        "btc_poseido": btc_poseido,
+        "precio_entrada": precio_entrada,
+        "en_posicion": en_posicion,
+        "historial_operaciones": historial_operaciones[-20:] # Guardar últimas 20 operaciones
     }
-
-def guardar_estado(estado):
     try:
-        with open(ESTADO_FILE, "w") as f:
-            json.dump(estado, f, indent=4)
+        with open(ARCHIVO_ESTADO, "w") as f:
+            json.dump(estado, f)
     except Exception as e:
-        logging.error(f"Error guardando {ESTADO_FILE}: {e}")
+        print(f"[ERROR GUARDANDO ESTADO]: {e}")
 
-# ------------------------------------------------------------------
-# NOTIFICACIONES DE TELEGRAM
-# ------------------------------------------------------------------
-def enviar_telegram(mensaje, chat_id=None):
-    estado = cargar_estado()
-    cid = chat_id or estado.get("chat_id") or TELEGRAM_CHAT_ID
-    if not cid or TELEGRAM_TOKEN == "TU_TELEGRAM_TOKEN_AQUI":
-        logging.warning("Telegram no configurado adecuadamente (falta chat_id o token).")
-        return
-    
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": cid, "text": mensaje, "parse_mode": "Markdown"}
-    try:
-        requests.post(url, json=payload, timeout=10)
-    except Exception as e:
-        logging.error(f"Error enviando mensaje a Telegram: {e}")
+exchange = ccxt.kraken({'enableRateLimit': True})
 
-# ------------------------------------------------------------------
-# ANÁLISIS TÉCNICO DE MERCADO (ESTRATEGIA V5)
-# ------------------------------------------------------------------
-def obtener_analisis_tecnico():
+def obtener_datos(simbolo='BTC/USD'):
     try:
-        # Usamos Kraken: admite timeframe '4h' nativo y no tiene bloqueos IP en Render
-        exchange = ccxt.kraken()
-        velas = exchange.fetch_ohlcv('BTC/USD', timeframe='4h', limit=300)
-        df = pd.DataFrame(velas, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        ohlcv = exchange.fetch_ohlcv(simbolo, timeframe='4h', limit=50)
+        df = pd.DataFrame(ohlcv, columns=['tiempo', 'open', 'high', 'low', 'close', 'volume'])
+        df['sma_rapida'] = df['close'].rolling(5).mean()
+        df['sma_lenta'] = df['close'].rolling(20).mean()
         
-        # Indicadores: EMAs y SMA 200
-        df['EMA_9'] = df['close'].ewm(span=9, adjust=False).mean()
-        df['EMA_21'] = df['close'].ewm(span=21, adjust=False).mean()
-        df['SMA_200'] = df['close'].rolling(window=200).mean()
-
-        # RSI (14)
         delta = df['close'].diff()
-        gain = (delta.where(delta > 0, 0)).ewm(alpha=1/14, adjust=False).mean()
-        loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
-        rs = gain / loss
-        df['RSI'] = 100 - (100 / (1 + rs))
-
-        # ADX (14)
-        df['prev_close'] = df['close'].shift(1)
-        df['tr1'] = df['high'] - df['low']
-        df['tr2'] = (df['high'] - df['prev_close']).abs()
-        df['tr3'] = (df['low'] - df['prev_close']).abs()
-        df['tr'] = df[['tr1', 'tr2', 'tr3']].max(axis=1)
-
-        df['up_move'] = df['high'] - df['high'].shift(1)
-        df['down_move'] = df['low'].shift(1) - df['low']
-
-        df['+dm'] = 0.0
-        df['-dm'] = 0.0
-        df.loc[(df['up_move'] > df['down_move']) & (df['up_move'] > 0), '+dm'] = df['up_move']
-        df.loc[(df['down_move'] > df['up_move']) & (df['down_move'] > 0), '-dm'] = df['down_move']
-
-        df['tr_14'] = df['tr'].ewm(alpha=1/14, adjust=False).mean()
-        df['+dm_14'] = df['+dm'].ewm(alpha=1/14, adjust=False).mean()
-        df['-dm_14'] = df['-dm'].ewm(alpha=1/14, adjust=False).mean()
-
-        df['+di'] = 100 * (df['+dm_14'] / df['tr_14'])
-        df['-di'] = 100 * (df['-dm_14'] / df['tr_14'])
-        df['dx'] = 100 * (df['+di'] - df['-di']).abs() / (df['+di'] + df['-di'])
-        df['ADX'] = df['dx'].ewm(alpha=1/14, adjust=False).mean()
-
-        df = df.dropna()
-        actual = df.iloc[-1]
-        anterior = df.iloc[-2]
-        return actual, anterior
+        gain = delta.where(delta > 0, 0)
+        loss = -delta.where(delta < 0, 0)
+        avg_gain = gain.rolling(window=14).mean()
+        avg_loss = loss.rolling(window=14).mean()
+        rs = avg_gain / avg_loss
+        df['rsi'] = 100 - (100 / (1 + rs))
+        return df
     except Exception as e:
-        logging.error(f"Error obteniendo datos del mercado: {e}")
-        return None, None
+        print(f"[ERROR KRAKEN]: {e}")
+        return None
 
-# ------------------------------------------------------------------
-# BUCLE DE TRADING AUTOMÁTICO (EVALUACIÓN CADA 5 MINUTOS)
-# ------------------------------------------------------------------
-def ejecutar_ciclo_trading():
-    logging.info("Iniciando motor de Paper Trading V5...")
-    while True:
-        try:
-            estado = cargar_estado()
-            actual, anterior = obtener_analisis_tecnico()
+# =========================================================
+# SERVIDOR WEB PARA VER EL ESTADO EN EL NAVEGADOR
+# =========================================================
+class WebPanelHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/html; charset=utf-8')
+        self.end_headers()
 
-            if actual is not None and anterior is not None:
-                precio_actual = actual['close']
-                high_actual = actual['high']
-                low_actual = actual['low']
-                rsi = actual['RSI']
-                adx = actual['ADX']
-                ema9 = actual['EMA_9']
-                ema21 = actual['EMA_21']
-                sma200 = actual['SMA_200']
+        df = obtener_datos('BTC/USD')
+        precio_actual = df.iloc[-1]['close'] if df is not None else 0.0
+        rsi_actual = df.iloc[-1]['rsi'] if df is not None else 0.0
 
-                # 1. SI ESTAMOS EN POSICIÓN: EVALUAR SALIDAS Y TRAILING STOP
-                if estado["en_posicion"]:
-                    if high_actual > estado["max_precio_alcanzado"]:
-                        estado["max_precio_alcanzado"] = high_actual
-                        guardar_estado(estado)
+        valor_btc = btc_poseido * precio_actual
+        valor_total = saldo_usd + valor_btc
+        pnl = valor_total - 1000.0
+        pnl_pct = (pnl / 1000.0) * 100
 
-                    precio_compra = estado["precio_compra"]
-                    precio_tp = precio_compra * (1 + TAKE_PROFIT_PCT / 100.0)
-                    precio_sl_inicial = precio_compra * (1 - STOP_LOSS_INICIAL_PCT / 100.0)
-                    precio_trailing = estado["max_precio_alcanzado"] * (1 - TRAILING_STOP_DIST_PCT / 100.0)
-                    stop_efectivo = max(precio_sl_inicial, precio_trailing)
+        filas_historial = ""
+        for op in reversed(historial_operaciones):
+            color = "#22c55e" if op.get("tipo") == "COMPRA" else ("#ef4444" if "STOP" in op.get("tipo") else "#3b82f6")
+            filas_historial += f"""
+            <tr>
+                <td style="padding: 8px; border-bottom: 1px solid #334155;">{op.get('fecha', '')}</td>
+                <td style="padding: 8px; border-bottom: 1px solid #334155; color: {color}; font-weight: bold;">{op.get('tipo', '')}</td>
+                <td style="padding: 8px; border-bottom: 1px solid #334155;">${op.get('precio', 0):,.2f}</td>
+                <td style="padding: 8px; border-bottom: 1px solid #334155;">{op.get('detalle', '')}</td>
+            </tr>
+            """
 
-                    cruce_bajista = (anterior['EMA_9'] >= anterior['EMA_21']) and (ema9 < ema21)
+        if not filas_historial:
+            filas_historial = "<tr><td colspan='4' style='padding: 12px; text-align: center; color: #94a3b8;'>Sin operaciones registradas aún.</td></tr>"
 
-                    vender = False
-                    motivo = ""
-                    precio_salida = precio_actual
+        html = f"""
+        <!DOCTYPE html>
+        <html lang="es">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Panel Bot de Trading</title>
+            <style>
+                body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #0f172a; color: #f8fafc; margin: 0; padding: 20px; }}
+                .container {{ max-width: 800px; margin: 0 auto; }}
+                .card {{ background-color: #1e293b; border-radius: 12px; padding: 20px; margin-bottom: 20px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); }}
+                .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; }}
+                .stat-box {{ background-color: #0f172a; padding: 15px; border-radius: 8px; text-align: center; }}
+                .stat-title {{ font-size: 0.85em; color: #94a3b8; margin-bottom: 5px; }}
+                .stat-value {{ font-size: 1.4em; font-weight: bold; }}
+                .positive {{ color: #22c55e; }}
+                .negative {{ color: #ef4444; }}
+                .status-badge {{ display: inline-block; padding: 4px 12px; border-radius: 20px; font-weight: bold; font-size: 0.9em; }}
+                .badge-buy {{ background-color: #166534; color: #4ade80; }}
+                .badge-wait {{ background-color: #334155; color: #cbd5e1; }}
+                table {{ width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 0.9em; }}
+                th {{ text-align: left; padding: 8px; background-color: #0f172a; color: #94a3b8; }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1 style="text-align: center; margin-bottom: 30px;">🤖 Panel de Control - Bot de Trading</h1>
+                
+                <div class="card">
+                    <h2>📊 Resumen de Cartera</h2>
+                    <div class="grid">
+                        <div class="stat-box">
+                            <div class="stat-title">Valor Total Estimado</div>
+                            <div class="stat-value">${valor_total:,.2f}</div>
+                        </div>
+                        <div class="stat-box">
+                            <div class="stat-title">Saldo en USD</div>
+                            <div class="stat-value">${saldo_usd:,.2f}</div>
+                        </div>
+                        <div class="stat-box">
+                            <div class="stat-title">BTC Poseído</div>
+                            <div class="stat-value">{btc_poseido:.6f}</div>
+                        </div>
+                        <div class="stat-box">
+                            <div class="stat-title">Rendimiento (P/L)</div>
+                            <div class="stat-value {'positive' if pnl >= 0 else 'negative'}">${pnl:+,.2f} ({pnl_pct:+.2f}%)</div>
+                        </div>
+                    </div>
+                </div>
 
-                    if high_actual >= precio_tp:
-                        vender = True
-                        motivo = f"Take Profit (+{TAKE_PROFIT_PCT}%)"
-                        precio_salida = precio_tp
-                    elif low_actual <= stop_efectivo:
-                        vender = True
-                        es_trailing = stop_efectivo > precio_sl_inicial
-                        motivo = f"Trailing Stop (-{TRAILING_STOP_DIST_PCT}% del máximo)" if es_trailing else f"Stop Loss Inicial (-{STOP_LOSS_INICIAL_PCT}%)"
-                        precio_salida = stop_efectivo
-                    elif cruce_bajista:
-                        vender = True
-                        motivo = "Cruce Bajista EMA 9/21"
-                        precio_salida = precio_actual
+                <div class="card">
+                    <h2>📈 Estado del Mercado (BTC/USD)</h2>
+                    <div class="grid">
+                        <div class="stat-box">
+                            <div class="stat-title">Precio BTC</div>
+                            <div class="stat-value">${precio_actual:,.2f}</div>
+                        </div>
+                        <div class="stat-box">
+                            <div class="stat-title">RSI (14)</div>
+                            <div class="stat-value">{rsi_actual:.1f}</div>
+                        </div>
+                        <div class="stat-box">
+                            <div class="stat-title">Estado Actual</div>
+                            <div class="stat-value">
+                                <span class="status-badge {'badge-buy' if en_posicion else 'badge-wait'}">
+                                    {'COMPRADO' if en_posicion else 'EN ESPERA'}
+                                </span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
 
-                    if vender:
-                        capital_obtenido = estado["btc_comprado"] * precio_salida
-                        saldo_final = capital_obtenido * (1 - COMISION)
-                        
-                        inversion_inicial = estado["precio_compra"] * estado["btc_comprado"] / (1 - COMISION)
-                        pnl_pct = ((saldo_final - inversion_inicial) / inversion_inicial) * 100
-                        
-                        estado["saldo_usdt"] = saldo_final
-                        estado["btc_comprado"] = 0.0
-                        estado["en_posicion"] = False
-                        
-                        log_op = f"🔴 *VENTA REALIZADA (PAPER)*\nMotivo: {motivo}\nPrecio Salida: ${precio_salida:,.2f}\nPNL Operación: {pnl_pct:+.2f}%\nNuevo Saldo USDT: ${saldo_final:,.2f}"
-                        estado["historial"].append(log_op)
-                        guardar_estado(estado)
-                        enviar_telegram(log_op)
+                <div class="card">
+                    <h2>📜 Historial de Operaciones</h2>
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Fecha</th>
+                                <th>Tipo</th>
+                                <th>Precio BTC</th>
+                                <th>Detalle</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {filas_historial}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+        self.wfile.write(html.encode('utf-8'))
 
-                # 2. SI NO ESTAMOS EN POSICIÓN: EVALUAR COMPRA
-                else:
-                    cruce_alcista = (anterior['EMA_9'] <= anterior['EMA_21']) and (ema9 > ema21)
-                    tendencia_alcista = precio_actual > sma200
-
-                    if cruce_alcista and rsi < 65 and tendencia_alcista and adx > ADX_MINIMO:
-                        capital_disponible = estado["saldo_usdt"] * (1 - COMISION)
-                        btc_comprados = capital_disponible / precio_actual
-                        
-                        estado["btc_comprado"] = btc_comprados
-                        estado["precio_compra"] = precio_actual
-                        estado["max_precio_alcanzado"] = high_actual
-                        estado["saldo_usdt"] = 0.0
-                        estado["en_posicion"] = True
-                        
-                        log_op = f"🟢 *COMPRA REALIZADA (PAPER)*\nPar: {SYMBOL}\nPrecio Entrado: ${precio_actual:,.2f}\nCantidad BTC: {btc_comprados:.6f}\nADX Actual: {adx:.1f}\nRSI: {rsi:.1f}"
-                        estado["historial"].append(log_op)
-                        guardar_estado(estado)
-                        enviar_telegram(log_op)
-
-        except Exception as e:
-            logging.error(f"Error en ciclo de trading: {e}")
-
-        # Esperar 5 minutos entre chequeos
-        time.sleep(300)
-
-# ------------------------------------------------------------------
-# ESCUCHA DE COMANDOS EN TELEGRAM (POLLING)
-# ------------------------------------------------------------------
-def procesar_comandos_telegram():
-    if TELEGRAM_TOKEN == "TU_TELEGRAM_TOKEN_AQUI":
+    def log_message(self, format, *args):
         return
 
-    offset = None
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+def run_web_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(('0.0.0.0', port), WebPanelHandler)
+    print(f"[SERVIDOR WEB] Panel activo en el puerto {port}")
+    server.serve_forever()
 
+# =========================================================
+# ESTRATEGIA Y LÓGICA DE TRADING
+# =========================================================
+def registrar_operacion(tipo, precio, detalle):
+    fecha_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    historial_operaciones.append({
+        "fecha": fecha_str,
+        "tipo": tipo,
+        "precio": precio,
+        "detalle": detalle
+    })
+
+def ejecutar_estrategia():
+    global saldo_usd, btc_poseido, precio_entrada, en_posicion
+    simbolo = 'BTC/USD'
+    
+    df = obtener_datos(simbolo)
+    if df is None: return
+    
+    precio_actual = df.iloc[-1]['close']
+    
+    vela_cerrada_actual = df.iloc[-2]
+    vela_cerrada_anterior = df.iloc[-3]
+    
+    if en_posicion:
+        rendimiento = (precio_actual - precio_entrada) / precio_entrada
+        var_pct = rendimiento * 100
+        
+        # Stop Loss
+        if rendimiento <= -STOP_LOSS_PCT:
+            saldo_usd = btc_poseido * precio_actual
+            print(f"[VENTA] Stop Loss a ${precio_actual:,.2f} ({var_pct:.2f}%)")
+            registrar_operacion("STOP LOSS", precio_actual, f"Pérdida: {var_pct:.2f}% | Saldo: ${saldo_usd:,.2f}")
+            en_posicion = False
+            btc_poseido = 0.0
+            guardar_estado()
+            
+        # Take Profit
+        elif rendimiento >= TAKE_PROFIT_PCT:
+            saldo_usd = btc_poseido * precio_actual
+            print(f"[VENTA] Take Profit a ${precio_actual:,.2f} (+{var_pct:.2f}%)")
+            registrar_operacion("TAKE PROFIT", precio_actual, f"Ganancia: +{var_pct:.2f}% | Saldo: ${saldo_usd:,.2f}")
+            en_posicion = False
+            btc_poseido = 0.0
+            guardar_estado()
+            
+        # Venta Técnica
+        elif vela_cerrada_anterior['sma_rapida'] >= vela_cerrada_anterior['sma_lenta'] and vela_cerrada_actual['sma_rapida'] < vela_cerrada_actual['sma_lenta']:
+            saldo_usd = btc_poseido * precio_actual
+            print(f"[VENTA] Cruce Bajista a ${precio_actual:,.2f} ({var_pct:+.2f}%)")
+            registrar_operacion("VENTA TÉCNICA", precio_actual, f"Resultado: {var_pct:+.2f}% | Saldo: ${saldo_usd:,.2f}")
+            en_posicion = False
+            btc_poseido = 0.0
+            guardar_estado()
+
+    else:
+        cruce_alcista = (vela_cerrada_anterior['sma_rapida'] <= vela_cerrada_anterior['sma_lenta']) and (vela_cerrada_actual['sma_rapida'] > vela_cerrada_actual['sma_lenta'])
+        rsi_favorable = vela_cerrada_actual['rsi'] < 60
+        
+        if cruce_alcista and rsi_favorable:
+            btc_poseido = saldo_usd / precio_actual
+            precio_entrada = precio_actual
+            
+            print(f"[COMPRA] Entrada a ${precio_actual:,.2f}")
+            registrar_operacion("COMPRA", precio_actual, f"Cantidad: {btc_poseido:.6f} BTC")
+            en_posicion = True
+            saldo_usd = 0.0
+            guardar_estado()
+
+# =========================================================
+# ARRANQUE PRINCIPAL
+# =========================================================
+if __name__ == '__main__':
+    threading.Thread(target=run_web_server, daemon=True).start()
+    print("🧠 Bot iniciado sin dependencias de Telegram.")
+    
     while True:
         try:
-            params = {"timeout": 20, "offset": offset}
-            res = requests.get(url, params=params, timeout=25).json()
-            
-            if "result" in res:
-                for update in res["result"]:
-                    offset = update["update_id"] + 1
-                    message = update.get("message", {})
-                    text = message.get("text", "")
-                    chat_id = message.get("chat", {}).get("id")
-
-                    if not chat_id or not text:
-                        continue
-
-                    # Guardar chat_id automático
-                    estado = cargar_estado()
-                    if estado.get("chat_id") != chat_id:
-                        estado["chat_id"] = chat_id
-                        guardar_estado(estado)
-
-                    # Comandos
-                    if text == "/start" or text == "/ayuda":
-                        msg = ("🤖 *Trading Bot V5 Activo*\n\n"
-                               "Comandos disponibles:\n"
-                               "➡️ /estado - Ver indicadores de BTC y posición actual\n"
-                               "➡️ /saldo - Ver tu saldo en USDT, BTC y rentabilidad\n"
-                               "➡️ /reset - Reiniciar saldo simulado a $1,000 USDT")
-                        enviar_telegram(msg, chat_id)
-
-                    elif text == "/saldo":
-                        actual, _ = obtener_analisis_tecnico()
-                        precio_actual = actual['close'] if actual is not None else 0.0
-                        
-                        if estado["en_posicion"]:
-                            valor_btc = estado["btc_comprado"] * precio_actual
-                            pnl = ((valor_btc - (estado["precio_compra"] * estado["btc_comprado"])) / (estado["precio_compra"] * estado["btc_comprado"])) * 100
-                            msg = f"💰 *SALDO PAPER TRADING*\n\nPosición: COMPRADO 🟢\nBTC Poseído: {estado['btc_comprado']:.6f}\nPrecio Compra: ${estado['precio_compra']:,.2f}\nValor Actual: ${valor_btc:,.2f}\nProfit Flotante: {pnl:+.2f}%"
-                        else:
-                            rentabilidad = ((estado['saldo_usdt'] - 1000.0) / 1000.0) * 100
-                            msg = f"💰 *SALDO PAPER TRADING*\n\nSaldo Disponible: ${estado['saldo_usdt']:,.2f} USDT\nProfit Acumulado: {rentabilidad:+.2f}%"
-                        
-                        enviar_telegram(msg, chat_id)
-
-                    elif text == "/estado":
-                        actual, _ = obtener_analisis_tecnico()
-                        if actual is not None:
-                            precio = actual['close']
-                            rsi = actual['RSI']
-                            adx = actual['ADX']
-                            pos = "COMPRADO 🟢" if estado["en_posicion"] else "EN ESPERA ⚪"
-                            msg = f"📊 *ESTADO DEL MERCADO (BTC/USDT)*\n\nPrecio Actual: ${precio:,.2f}\nADX (4H): {adx:.1f} (Mín: {ADX_MINIMO})\nRSI (4H): {rsi:.1f}\nEstado Bot: {pos}"
-                        else:
-                            msg = "⚠️ Error consultando mercado en Binance."
-                        enviar_telegram(msg, chat_id)
-
-                    elif text == "/reset":
-                        estado["saldo_usdt"] = 1000.0
-                        estado["btc_comprado"] = 0.0
-                        estado["en_posicion"] = False
-                        estado["precio_compra"] = 0.0
-                        estado["max_precio_alcanzado"] = 0.0
-                        estado["historial"] = []
-                        guardar_estado(estado)
-                        enviar_telegram("🔄 *Paper Trading Reiniciado:* Saldo reestablecido a $1,000.00 USDT.", chat_id)
-
+            ejecutar_estrategia()
         except Exception as e:
-            logging.error(f"Error escuchando Telegram: {e}")
-            time.sleep(5)
-
-# ------------------------------------------------------------------
-# ARRANQUE MULTI-THREADING
-# ------------------------------------------------------------------
-if __name__ == "__main__":
-    # Thread 1: Ciclo de trading continuo
-    t_trading = threading.Thread(target=ejecutar_ciclo_trading, daemon=True)
-    t_trading.start()
-
-    # Thread 2: Escucha de comandos Telegram
-    t_telegram = threading.Thread(target=procesar_comandos_telegram, daemon=True)
-    t_telegram.start()
-
-    # Thread Principal: Servidor Web Flask (para Render)
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+            print(f"[ERROR BUCLE]: {e}")
+        time.sleep(300)
