@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <title>Panel del Bot de Trading V6</title>
+    <!-- Refresco automático cada 60 segundos para no saturar la API de Binance/Kraken -->
+    <meta http-equiv="refresh" content="60">
+    <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+    <style>
+        body { font-family: monospace; padding: 20px; background-color: #121212; color: #00ff66; }
+        h2 { color: #ffffff; border-bottom: 1px solid #333; padding-bottom: 10px; }
+        .box { background: #1e1e1e; padding: 15px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #333; }
+        ul { list-style-type: none; padding: 0; margin: 0; }
+        li { padding: 8px 0; border-bottom: 1px solid #2a2a2a; color: #cccccc; font-size: 14px; }
+        .stat { margin: 6px 0; font-size: 16px; }
+        .highlight { color: #ffeb3b; font-weight: bold; }
+        #chart-container { width: 100%; height: 400px; border-radius: 8px; overflow: hidden; border: 1px solid #333; margin-top: 15px; }
+    </style>
+</head>
+<body>
+    <h2>🧠 Panel de Control V6 (Gráfico + ADX + Trailing Stop)</h2>
+    
+    <div class="box">
+        <div class="stat"><strong>Saldo Libre:</strong> ${{ "{:,.2f}".format(estado.saldo_usd) }} USDT</div>
+        <div class="stat"><strong>BTC Poseídos:</strong> {{ "{:.6f}".format(estado.btc_poseidos) }} BTC</div>
+        <div class="stat"><strong>Estado:</strong> {{ '🟢 EN POSICIÓN' if estado.en_posicion else '🔴 LIQUIDEZ (USDT)' }}</div>
+        {% if estado.en_posicion %}
+            <div class="stat"><strong>Precio Entrada:</strong> ${{ "{:,.2f}".format(estado.precio_compra) }}</div>
+            <div class="stat highlight"><strong>Precio Max Alcanzado (Para Stop):</strong> ${{ "{:,.2f}".format(estado.precio_max_alcanzado) }}</div>
+        {% endif %}
+    </div>
+
+    <div class="box">
+        <h3 style="margin-top: 0; color: #fff;">📊 BTC/USDT (Velas 15m y SMA 20)</h3>
+        <div id="chart-container"></div>
+    </div>
+
+    <h3>📋 Última Actividad (Auto-refresco 60s)</h3>
+    <div class="box">
+        <ul>
+            {% if estado.historial %}
+                {% for item in estado.historial %}
+                    <li>{{ item }}</li>
+                {% endfor %}
+            {% else %}
+                <li>Sin actividad registrada aún.</li>
+            {% endif %}
+        </ul>
+    </div>
+
+    <script>
+        const container = document.getElementById('chart-container');
+        
+        const chart = LightweightCharts.createChart(container, {
+            layout: { backgroundColor: '#1e1e1e', textColor: '#d1d4dc' },
+            grid: { vertLines: { color: '#2a2a2a' }, horzLines: { color: '#2a2a2a' } },
+            timeScale: { timeVisible: true }
+        });
+
+        const candleSeries = chart.addCandlestickSeries({
+            upColor: '#00ff66', downColor: '#ff3333', borderVisible: false,
+            wickUpColor: '#00ff66', wickDownColor: '#ff3333'
+        });
+
+        const smaSeries = chart.addLineSeries({ color: '#2962FF', lineWidth: 2, title: 'SMA 20' });
+
+        fetch('/api/candles')
+            .then(res => res.json())
+            .then(data => {
+                candleSeries.setData(data.candles);
+                smaSeries.setData(data.sma20);
+            });
+
+        window.addEventListener('resize', () => { chart.applyOptions({ width: container.clientWidth }); });
+    </script>
+</body>
+</html>
