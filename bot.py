@@ -187,11 +187,14 @@ def actualizar_estadisticas_venta(estado, saldo_obtenido, ganancia_usd):
         estado['trades_perdedores'] += 1
         estado['gross_loss'] += abs(ganancia_usd)
 
+# --- AHORA (Con Kraken) ---
 def analizar_y_operar():
     estado = obtener_estado()
-    exchange = ccxt.binance()
+    exchange = ccxt.kraken({'enableRateLimit': True})
     
-    ohlcv = exchange.fetch_ohlcv('BTC/USDT', timeframe='15m', limit=50)
+    # En Kraken usamos BTC/USD
+    ohlcv = exchange.fetch_ohlcv('BTC/USD', timeframe='15m', limit=50)
+    
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['sma_20'] = df['close'].rolling(20).mean()
     
