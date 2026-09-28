@@ -44,7 +44,14 @@ def obtener_estado():
     
     # Asegurar que las llaves nuevas existan si la DB es antigua
     if "balance_history" not in estado:
-        estado.update({"balance_history": [1000.0], "trades_ganadores": 0, "trades_perdedores": 0, "gross_profit": 0.0, "gross_loss": 0.0, "max_balance": estado.get("saldo_usd", 1000.0)})
+        estado.update({
+            "balance_history": [1000.0], 
+            "trades_ganadores": 0, 
+            "trades_perdedores": 0, 
+            "gross_profit": 0.0, 
+            "gross_loss": 0.0, 
+            "max_balance": estado.get("saldo_usd", 1000.0)
+        })
     return estado
 
 def guardar_estado(estado):
@@ -97,13 +104,13 @@ class WebHandler(BaseHTTPRequestHandler):
             </style>
         </head>
         <body>
-            <h2>📊 Panel de Control Cuantitativo (BTC)</h2>
+            <h2>📊 Panel de Control Cuantitativo (BTC/USD - Kraken)</h2>
             
             <!-- TARJETAS DE ESTADO -->
             <div class="grid">
                 <div class="box">
                     <div class="metric-title">Capital Actual</div>
-                    <div class="metric-value">${saldo_actual:,.2f} USDT</div>
+                    <div class="metric-value">${saldo_actual:,.2f} USD</div>
                     <div style="margin-top:10px; color:{'#ff4444' if estado['en_posicion'] else '#00ff66'}">
                         Estado: {'🟢 EN POSICIÓN' if estado['en_posicion'] else '🔴 LÍQUIDO'}
                     </div>
@@ -138,7 +145,7 @@ class WebHandler(BaseHTTPRequestHandler):
                     data: {{
                         labels: labels,
                         datasets: [{{
-                            label: 'Evolución del Capital (USDT)',
+                            label: 'Evolución del Capital (USD)',
                             data: balances,
                             borderColor: '#00ff66',
                             backgroundColor: 'rgba(0, 255, 102, 0.1)',
@@ -190,9 +197,11 @@ def actualizar_estadisticas_venta(estado, saldo_obtenido, ganancia_usd):
 # --- AHORA (Con Kraken) ---
 def analizar_y_operar():
     estado = obtener_estado()
+    
+    # 1. Instanciamos el exchange de Kraken en lugar de Binance
     exchange = ccxt.kraken({'enableRateLimit': True})
     
-    # En Kraken usamos BTC/USD
+    # 2. En Kraken usamos BTC/USD en lugar de BTC/USDT
     ohlcv = exchange.fetch_ohlcv('BTC/USD', timeframe='15m', limit=50)
     
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -260,7 +269,7 @@ def bucle_trading():
 
 if __name__ == '__main__':
     if MONGO_URI:
-        print("=== BOT V6 INICIADO (Dashboard Profesional) ===", flush=True)
+        print("=== BOT V6 INICIADO (Dashboard Profesional - KRAKEN) ===", flush=True)
         hilo_bot = threading.Thread(target=bucle_trading)
         hilo_bot.daemon = True
         hilo_bot.start()
