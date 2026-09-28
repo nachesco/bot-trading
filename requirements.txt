@@ -1,5 +1,5 @@
+Flask
 ccxt
 pandas
-requests
-flask
-pymongo[srv]
+numpy
+pymongo
