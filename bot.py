@@ -11,6 +11,7 @@ from datetime import datetime
 # --- CONFIGURACIÓN DE RIESGO Y ESTRATEGIA ---
 STOP_LOSS_PCT = 2.0
 TAKE_PROFIT_PCT = 4.0
+TRAILING_STOP_PCT = 1.5  # Distancia en % desde el precio máximo alcanzado
 
 # --- CONEXIÓN A MONGODB ---
 MONGO_URI = os.environ.get("MONGO_URI")
@@ -32,17 +33,23 @@ def obtener_estado():
             "precio_compra": 0.0,
             "en_posicion": False,
             "historial": [],
-            # NUEVAS MÉTRICAS:
             "balance_history": [1000.0], 
             "trades_ganadores": 0,
             "trades_perdedores": 0,
             "gross_profit": 0.0,
             "gross_loss": 0.0,
-            "max_balance": 1000.0
+            "max_balance": 1000.0,
+            "precio_max_alcanzado": 0.0,
+            "stop_dinamico": 0.0
         }
         coleccion_estado.insert_one(estado)
     
     # Asegurar que las llaves nuevas existan si la DB es antigua
+    if "precio_max_alcanzado" not in estado:
+        estado.update({
+            "precio_max_alcanzado": estado.get("precio_compra", 0.0),
+            "stop_dinamico": 0.0
+        })
     if "balance_history" not in estado:
         estado.update({
             "balance_history": [1000.0], 
@@ -85,6 +92,9 @@ class WebHandler(BaseHTTPRequestHandler):
         historial_items = "".join([f"<li>{item}</li>" for item in estado.get('historial', [])])
         balance_json = json.dumps(estado['balance_history'])
         
+        # Info extra del Stop Dinámico para el dashboard
+        stop_info_html = f"Stop Dinámico: ${estado.get('stop_dinamico', 0):,.2f}" if estado['en_posicion'] else "Sin Stop Activo"
+
         html = f"""
         <html>
         <head>
@@ -119,7 +129,7 @@ class WebHandler(BaseHTTPRequestHandler):
                     <div class="metric-title">Win Rate / Profit Factor</div>
                     <div class="metric-value">{win_rate:.1f}% / {profit_factor:.2f}</div>
                     <div style="margin-top:10px; color:#ffb86c">
-                        Max Drawdown: -{drawdown:.2f}%
+                        {stop_info_html}
                     </div>
                 </div>
             </div>
@@ -198,10 +208,7 @@ def actualizar_estadisticas_venta(estado, saldo_obtenido, ganancia_usd):
 def analizar_y_operar():
     estado = obtener_estado()
     
-    # 1. Instanciamos el exchange de Kraken en lugar de Binance
     exchange = ccxt.kraken({'enableRateLimit': True})
-    
-    # 2. En Kraken usamos BTC/USD en lugar de BTC/USDT
     ohlcv = exchange.fetch_ohlcv('BTC/USD', timeframe='15m', limit=50)
     
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -210,7 +217,7 @@ def analizar_y_operar():
     precio_actual = df['close'].iloc[-1]
     media_actual = df['sma_20'].iloc[-1]
     
-    # Guardamos el último precio para que el dashboard calcule el saldo si estamos en posición
+    # Guardamos el último precio para que el dashboard calcule el saldo
     estado['ultimo_precio'] = precio_actual 
 
     if estado['en_posicion']:
@@ -218,21 +225,45 @@ def analizar_y_operar():
         saldo_obtenido = estado['btc_poseidos'] * precio_actual
         ganancia_usd = saldo_obtenido - (estado['btc_poseidos'] * estado['precio_compra'])
 
-        # TAKE PROFIT (+4%)
+        # --- LÓGICA DE TRAILING STOP ---
+        # 1. Actualizamos el precio máximo alcanzado
+        precio_max_alcanzado = estado.get('precio_max_alcanzado', estado['precio_compra'])
+        if precio_actual > precio_max_alcanzado:
+            precio_max_alcanzado = precio_actual
+            estado['precio_max_alcanzado'] = precio_max_alcanzado
+
+        # 2. Calculamos los dos stops (El fijo inicial y el dinámico)
+        precio_stop_inicial = estado['precio_compra'] * (1 - STOP_LOSS_PCT / 100)
+        precio_trailing = precio_max_alcanzado * (1 - TRAILING_STOP_PCT / 100)
+        
+        # 3. El stop real será el mayor de los dos
+        stop_dinamico = max(precio_stop_inicial, precio_trailing)
+        estado['stop_dinamico'] = stop_dinamico
+
+        # TAKE PROFIT (+4%) - Opcional, lo mantenemos por si quieres un límite superior duro
         if porcentaje_variacion >= TAKE_PROFIT_PCT:
             actualizar_estadisticas_venta(estado, saldo_obtenido, ganancia_usd)
             estado['saldo_usd'] = saldo_obtenido
             estado['btc_poseidos'] = 0.0
             estado['en_posicion'] = False
+            estado['precio_max_alcanzado'] = 0.0
+            estado['stop_dinamico'] = 0.0
             registrar_evento(estado, f"🎯 TAKE PROFIT (+{TAKE_PROFIT_PCT}%) | Venta: ${precio_actual:,.2f} | Ganancia: +${ganancia_usd:,.2f}")
 
-        # STOP LOSS (-2%)
-        elif porcentaje_variacion <= -STOP_LOSS_PCT:
+        # STOP DINÁMICO (Stop Loss / Trailing Stop)
+        elif precio_actual <= stop_dinamico:
             actualizar_estadisticas_venta(estado, saldo_obtenido, ganancia_usd)
             estado['saldo_usd'] = saldo_obtenido
             estado['btc_poseidos'] = 0.0
             estado['en_posicion'] = False
-            registrar_evento(estado, f"🛑 STOP LOSS (-{STOP_LOSS_PCT}%) | Venta: ${precio_actual:,.2f} | Pérdida: -${abs(ganancia_usd):,.2f}")
+            estado['precio_max_alcanzado'] = 0.0
+            estado['stop_dinamico'] = 0.0
+            
+            # Formatear el mensaje dependiendo de si fue el Trailing o el Inicial
+            if stop_dinamico == precio_trailing and precio_trailing > precio_stop_inicial:
+                registrar_evento(estado, f"🛡️ TRAILING STOP | Venta: ${precio_actual:,.2f} | Resultado: ${ganancia_usd:+,.2f}")
+            else:
+                registrar_evento(estado, f"🛑 STOP LOSS (-{STOP_LOSS_PCT}%) | Venta: ${precio_actual:,.2f} | Pérdida: -${abs(ganancia_usd):,.2f}")
 
         # VENTA POR ESTRATEGIA (Cruce bajista SMA 20)
         elif precio_actual < media_actual:
@@ -240,6 +271,8 @@ def analizar_y_operar():
             estado['saldo_usd'] = saldo_obtenido
             estado['btc_poseidos'] = 0.0
             estado['en_posicion'] = False
+            estado['precio_max_alcanzado'] = 0.0
+            estado['stop_dinamico'] = 0.0
             registrar_evento(estado, f"🔴 VENTA (Bajo SMA) | Venta: ${precio_actual:,.2f} | Resultado: ${ganancia_usd:+,.2f}")
         
         else:
@@ -250,6 +283,7 @@ def analizar_y_operar():
         if precio_actual > media_actual:
             estado['btc_poseidos'] = estado['saldo_usd'] / precio_actual
             estado['precio_compra'] = precio_actual
+            estado['precio_max_alcanzado'] = precio_actual # Inicializamos el trailing al comprar
             estado['en_posicion'] = True
             estado['saldo_usd'] = 0.0
             registrar_evento(estado, f"🟢 COMPRA | Entrada: ${precio_actual:,.2f} | SMA: ${media_actual:,.2f}")
