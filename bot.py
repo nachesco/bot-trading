@@ -261,15 +261,23 @@ def analizar_y_operar():
     estado = obtener_estado()
     exchange = ccxt.kraken({'enableRateLimit': True})
     
-    # 1. Marco de 15 minutos (Ejecución)
+    # 1. Marco de 15 minutos (Ejecución y Volumen)
     ohlcv_15m = exchange.fetch_ohlcv('BTC/USD', timeframe='15m', limit=50)
     df_15m = pd.DataFrame(ohlcv_15m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df_15m['sma_20'] = df_15m['close'].rolling(20).mean()
+    df_15m['vol_sma'] = df_15m['volume'].rolling(20).mean()  # Filtro de volumen institucional
     df_15m['rsi'] = calcular_rsi(df_15m['close'], period=RSI_PERIODO)
     
+    # Datos en vivo (para gestión de posiciones y stops)
     precio_actual = df_15m['close'].iloc[-1]
-    media_15m = df_15m['sma_20'].iloc[-1]
-    rsi_actual = df_15m['rsi'].iloc[-1]
+    media_15m_actual = df_15m['sma_20'].iloc[-1]
+    
+    # Datos de vela cerrada (iloc[-2]) para confirmación sólida de entrada
+    precio_cierre_15m = df_15m['close'].iloc[-2]
+    media_15m_cerrada = df_15m['sma_20'].iloc[-2]
+    rsi_cerrado = df_15m['rsi'].iloc[-2]
+    volumen_cerrado = df_15m['volume'].iloc[-2]
+    volumen_media_cerrada = df_15m['vol_sma'].iloc[-2]
     
     # 2. Marco de 1 hora (Filtro Multi-Timeframe Macro)
     ohlcv_1h = exchange.fetch_ohlcv('BTC/USD', timeframe='1h', limit=50)
@@ -279,16 +287,16 @@ def analizar_y_operar():
 
     # Guardar estado de mercado para el dashboard
     estado['ultimo_precio'] = precio_actual 
-    estado['ultima_sma_15m'] = media_15m
+    estado['ultima_sma_15m'] = media_15m_actual  # Mostramos la media actual en vivo
     estado['ultima_sma_1h'] = media_1h
-    estado['ultimo_rsi'] = rsi_actual
+    estado['ultimo_rsi'] = rsi_cerrado
 
     if estado['en_posicion']:
         porcentaje_variacion = ((precio_actual - estado['precio_compra']) / estado['precio_compra']) * 100
         saldo_obtenido = estado['btc_poseidos'] * precio_actual
         ganancia_usd = saldo_obtenido - (estado['btc_poseidos'] * estado['precio_compra'])
 
-        # Trailing Stop & Stop Loss
+        # Trailing Stop & Stop Loss dinámico evaluado en tiempo real
         precio_max_alcanzado = estado.get('precio_max_alcanzado', estado['precio_compra'])
         if precio_actual > precio_max_alcanzado:
             precio_max_alcanzado = precio_actual
@@ -322,7 +330,7 @@ def analizar_y_operar():
             else:
                 registrar_evento(estado, f"🛑 STOP LOSS (-{STOP_LOSS_PCT}%) | Venta: ${precio_actual:,.2f} | Pérdida: -${abs(ganancia_usd):,.2f}")
 
-        elif precio_actual < media_15m:
+        elif precio_actual < media_15m_actual:
             actualizar_estadisticas_venta(estado, saldo_obtenido, ganancia_usd)
             estado['saldo_usd'] = saldo_obtenido
             estado['btc_poseidos'] = 0.0
@@ -335,24 +343,26 @@ def analizar_y_operar():
             registrar_evento(estado, f"📦 Posición Activa | BTC: ${precio_actual:,.2f} | PnL: {porcentaje_variacion:+.2f}%")
 
     else:
-        # CONDICIONES DE ENTRADA (3 FILTROS OBLIGATORIOS)
-        cruce_alcista = precio_actual > media_15m
+        # CONDICIONES DE ENTRADA (4 FILTROS OBLIGATORIOS EVALUADOS EN VELA CERRADA)
+        cruce_alcista_confirmado = precio_cierre_15m > media_15m_cerrada
         tendencia_1h_alcista = precio_actual > media_1h
-        rsi_optimo = RSI_MIN <= rsi_actual <= RSI_MAX
+        rsi_optimo = RSI_MIN <= rsi_cerrado <= RSI_MAX
+        volumen_optimo = volumen_cerrado > volumen_media_cerrada
 
-        if cruce_alcista and tendencia_1h_alcista and rsi_optimo:
+        if cruce_alcista_confirmado and tendencia_1h_alcista and rsi_optimo and volumen_optimo:
             estado['btc_poseidos'] = estado['saldo_usd'] / precio_actual
             estado['precio_compra'] = precio_actual
             estado['precio_max_alcanzado'] = precio_actual
-            estado['stop_dinamico'] = precio_actual * (1 - STOP_LOSS_PCT / 100)  # Inicialización inmediata del Stop
+            estado['stop_dinamico'] = precio_actual * (1 - STOP_LOSS_PCT / 100)
             estado['en_posicion'] = True
             estado['saldo_usd'] = 0.0
-            registrar_evento(estado, f"🟢 COMPRA | Entrada: ${precio_actual:,.2f} | RSI: {rsi_actual:.1f} | 1h SMA: ${media_1h:,.2f}")
+            registrar_evento(estado, f"🟢 COMPRA | Entrada: ${precio_actual:,.2f} | Vol: OK | RSI: {rsi_cerrado:.1f}")
         else:
             bloqueos = []
-            if not cruce_alcista: bloqueos.append("15m < SMA")
-            if not tendencia_1h_alcista: bloqueos.append(f"1h Bajista (SMA 1h: ${media_1h:,.0f})")
-            if not rsi_optimo: bloqueos.append(f"RSI: {rsi_actual:.1f}")
+            if not cruce_alcista_confirmado: bloqueos.append("15m < SMA")
+            if not tendencia_1h_alcista: bloqueos.append(f"1h Bajista")
+            if not rsi_optimo: bloqueos.append(f"RSI: {rsi_cerrado:.1f}")
+            if not volumen_optimo: bloqueos.append("Vol bajo")
             
             info_filtro = " | ".join(bloqueos)
             registrar_evento(estado, f"💤 En Espera | BTC: ${precio_actual:,.2f} | [{info_filtro}]")
@@ -370,7 +380,7 @@ def bucle_trading():
 
 if __name__ == '__main__':
     if MONGO_URI:
-        print("=== BOT V6 INICIADO (Kraken + Trailing + MTF + RSI + Dashboard V2) ===", flush=True)
+        print("=== BOT V7 INICIADO (Cierre de Vela + Filtro Volumen + Dashboard V2) ===", flush=True)
         hilo_bot = threading.Thread(target=bucle_trading)
         hilo_bot.daemon = True
         hilo_bot.start()
