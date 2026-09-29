@@ -56,14 +56,21 @@ def obtener_estado():
             "gross_loss": 0.0,
             "max_balance": 1000.0,
             "precio_max_alcanzado": 0.0,
-            "stop_dinamico": 0.0
+            "stop_dinamico": 0.0,
+            "ultimo_precio": 0.0,
+            "ultima_sma_15m": 0.0,
+            "ultima_sma_1h": 0.0,
+            "ultimo_rsi": 0.0
         }
         coleccion_estado.insert_one(estado)
     
+    # Asegurar retrocompatibilidad con esquemas antiguos
     if "precio_max_alcanzado" not in estado:
         estado.update({"precio_max_alcanzado": estado.get("precio_compra", 0.0), "stop_dinamico": 0.0})
     if "balance_history" not in estado:
         estado.update({"balance_history": [1000.0], "trades_ganadores": 0, "trades_perdedores": 0, "gross_profit": 0.0, "gross_loss": 0.0, "max_balance": estado.get("saldo_usd", 1000.0)})
+    if "ultimo_precio" not in estado:
+        estado.update({"ultimo_precio": 0.0, "ultima_sma_15m": 0.0, "ultima_sma_1h": 0.0, "ultimo_rsi": 0.0})
     return estado
 
 def guardar_estado(estado):
@@ -86,16 +93,45 @@ class WebHandler(BaseHTTPRequestHandler):
         
         estado = obtener_estado()
         
+        # Métricas Cuantitativas
         total_trades = estado['trades_ganadores'] + estado['trades_perdedores']
         win_rate = (estado['trades_ganadores'] / total_trades * 100) if total_trades > 0 else 0
         profit_factor = (estado['gross_profit'] / estado['gross_loss']) if estado['gross_loss'] > 0 else (estado['gross_profit'] if estado['gross_profit'] > 0 else 0)
         
-        saldo_actual = estado['saldo_usd'] if not estado['en_posicion'] else (estado['btc_poseidos'] * estado.get('ultimo_precio', estado['precio_compra']))
+        precio_actual = estado.get('ultimo_precio', estado['precio_compra'])
+        saldo_actual = estado['saldo_usd'] if not estado['en_posicion'] else (estado['btc_poseidos'] * precio_actual)
         drawdown = ((estado['max_balance'] - saldo_actual) / estado['max_balance'] * 100) if estado['max_balance'] > 0 else 0
+
+        # Colores dinámicos
+        capital_color = "#00ff66" if saldo_actual >= 1000.0 else "#ff4444"
+        pf_color = "#00ff66" if profit_factor >= 1.0 else "#ffb86c"
+
+        # PnL Abierto (Flotante)
+        if estado['en_posicion'] and estado['precio_compra'] > 0 and precio_actual > 0:
+            pnl_pct = ((precio_actual - estado['precio_compra']) / estado['precio_compra']) * 100
+            pnl_color = "#00ff66" if pnl_pct >= 0 else "#ff4444"
+            pnl_str = f" <span style='color:{pnl_color}; font-size:13px; font-weight:bold;'>(PnL: {pnl_pct:+.2f}%)</span>"
+        else:
+            pnl_str = ""
+
+        # Información del Stop Dinámico
+        stop_val = estado.get('stop_dinamico', 0.0)
+        if estado['en_posicion'] and stop_val > 0:
+            stop_info_html = f"Stop Dinámico: ${stop_val:,.2f}"
+        elif estado['en_posicion']:
+            precio_stop_est = estado['precio_compra'] * (1 - STOP_LOSS_PCT / 100)
+            stop_info_html = f"Stop Inicial: ${precio_stop_est:,.2f}"
+        else:
+            stop_info_html = "Sin Stop Activo"
 
         historial_items = "".join([f"<li>{item}</li>" for item in estado.get('historial', [])])
         balance_json = json.dumps(estado['balance_history'])
-        stop_info_html = f"Stop Dinámico: ${estado.get('stop_dinamico', 0):,.2f}" if estado['en_posicion'] else "Sin Stop Activo"
+
+        # Valores de Mercado en Vivo
+        btc_price_str = f"${precio_actual:,.2f}" if precio_actual > 0 else "Cargando..."
+        sma_15m_str = f"${estado.get('ultima_sma_15m', 0):,.2f}" if estado.get('ultima_sma_15m', 0) > 0 else "--"
+        sma_1h_str = f"${estado.get('ultima_sma_1h', 0):,.2f}" if estado.get('ultima_sma_1h', 0) > 0 else "--"
+        rsi_str = f"{estado.get('ultimo_rsi', 0):.1f}" if estado.get('ultimo_rsi', 0) > 0 else "--"
 
         html = f"""
         <html>
@@ -104,43 +140,62 @@ class WebHandler(BaseHTTPRequestHandler):
             <meta http-equiv="refresh" content="30">
             <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
             <style>
-                body {{ font-family: monospace; padding: 20px; background-color: #0b0f19; color: #00ff66; max-width: 900px; margin: auto; }}
+                body {{ font-family: monospace; padding: 20px; background-color: #0b0f19; color: #00ff66; max-width: 950px; margin: auto; }}
                 h2 {{ color: #ffffff; border-bottom: 1px solid #333; padding-bottom: 10px; }}
-                .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }}
-                .box {{ background: #151a28; padding: 20px; border-radius: 8px; border: 1px solid #2a3441; margin-bottom: 20px; }}
-                .metric-title {{ color: #8892b0; font-size: 12px; text-transform: uppercase; }}
-                .metric-value {{ color: #ffffff; font-size: 24px; margin-top: 5px; }}
+                .grid-3 {{ display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 15px; margin-bottom: 20px; }}
+                .box {{ background: #151a28; padding: 18px; border-radius: 8px; border: 1px solid #2a3441; }}
+                .metric-title {{ color: #8892b0; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }}
+                .metric-value {{ font-size: 22px; font-weight: bold; margin-top: 5px; margin-bottom: 5px; }}
+                .sub-info {{ font-size: 12px; color: #a8b2d1; margin-top: 6px; }}
                 ul {{ list-style-type: none; padding: 0; margin: 0; }}
                 li {{ padding: 8px 0; border-bottom: 1px solid #2a3441; color: #a8b2d1; font-size: 13px; }}
-                canvas {{ max-height: 300px; }}
+                canvas {{ max-height: 280px; }}
+                @media (max-width: 768px) {{ .grid-3 {{ grid-template-columns: 1fr; }} }}
             </style>
         </head>
         <body>
             <h2>📊 Panel de Control Cuantitativo (BTC/USD - Kraken)</h2>
             
-            <div class="grid">
+            <!-- TARJETAS SUPERIORES (3 COLUMNAS) -->
+            <div class="grid-3">
+                <!-- TARJETA 1: CAPITAL & ESTADO -->
                 <div class="box">
                     <div class="metric-title">Capital Actual</div>
-                    <div class="metric-value">${saldo_actual:,.2f} USD</div>
-                    <div style="margin-top:10px; color:{'#ff4444' if estado['en_posicion'] else '#00ff66'}">
-                        Estado: {'🟢 EN POSICIÓN' if estado['en_posicion'] else '🔴 LÍQUIDO'}
+                    <div class="metric-value" style="color: {capital_color}">${saldo_actual:,.2f} USD</div>
+                    <div class="sub-info">
+                        Estado: {'🟢 EN POSICIÓN' if estado['en_posicion'] else '🔴 LÍQUIDO'}{pnl_str}
                     </div>
                 </div>
+
+                <!-- TARJETA 2: DESEMPETAÑA / MÉTRICAS -->
                 <div class="box">
                     <div class="metric-title">Win Rate / Profit Factor</div>
-                    <div class="metric-value">{win_rate:.1f}% / {profit_factor:.2f}</div>
-                    <div style="margin-top:10px; color:#ffb86c">
-                        {stop_info_html}
+                    <div class="metric-value" style="color: #ffffff">
+                        {win_rate:.1f}% / <span style="color: {pf_color}">{profit_factor:.2f}</span>
+                    </div>
+                    <div class="sub-info" style="color: #ffb86c">
+                        {stop_info_html} | DD: -{drawdown:.2f}%
+                    </div>
+                </div>
+
+                <!-- TARJETA 3: MERCADO EN VIVO -->
+                <div class="box">
+                    <div class="metric-title">Mercado BTC en Vivo</div>
+                    <div class="metric-value" style="color: #ffffff">{btc_price_str}</div>
+                    <div class="sub-info">
+                        SMA 15m: {sma_15m_str} | 1h: {sma_1h_str} | RSI: {rsi_str}
                     </div>
                 </div>
             </div>
 
-            <div class="box">
+            <!-- GRÁFICO DE CAPITAL -->
+            <div class="box" style="margin-bottom: 20px;">
                 <canvas id="equityChart"></canvas>
             </div>
 
+            <!-- HISTORIAL DE ACTIVIDAD -->
             <div class="box">
-                <div class="metric-title" style="margin-bottom:15px;">Última Actividad</div>
+                <div class="metric-title" style="margin-bottom:15px; color: #ffffff; font-size: 13px;">Última Actividad</div>
                 <ul>{historial_items if historial_items else '<li>Sin actividad registrada aún.</li>'}</ul>
             </div>
 
@@ -157,7 +212,7 @@ class WebHandler(BaseHTTPRequestHandler):
                             label: 'Evolución del Capital (USD)',
                             data: balances,
                             borderColor: '#00ff66',
-                            backgroundColor: 'rgba(0, 255, 102, 0.1)',
+                            backgroundColor: 'rgba(0, 255, 102, 0.08)',
                             borderWidth: 2,
                             fill: true,
                             tension: 0.3,
@@ -222,7 +277,11 @@ def analizar_y_operar():
     df_1h['sma_1h'] = df_1h['close'].rolling(SMA_1H_PERIODO).mean()
     media_1h = df_1h['sma_1h'].iloc[-1]
 
+    # Guardar estado de mercado para el dashboard
     estado['ultimo_precio'] = precio_actual 
+    estado['ultima_sma_15m'] = media_15m
+    estado['ultima_sma_1h'] = media_1h
+    estado['ultimo_rsi'] = rsi_actual
 
     if estado['en_posicion']:
         porcentaje_variacion = ((precio_actual - estado['precio_compra']) / estado['precio_compra']) * 100
@@ -285,11 +344,11 @@ def analizar_y_operar():
             estado['btc_poseidos'] = estado['saldo_usd'] / precio_actual
             estado['precio_compra'] = precio_actual
             estado['precio_max_alcanzado'] = precio_actual
+            estado['stop_dinamico'] = precio_actual * (1 - STOP_LOSS_PCT / 100)  # Inicialización inmediata del Stop
             estado['en_posicion'] = True
             estado['saldo_usd'] = 0.0
             registrar_evento(estado, f"🟢 COMPRA | Entrada: ${precio_actual:,.2f} | RSI: {rsi_actual:.1f} | 1h SMA: ${media_1h:,.2f}")
         else:
-            # Desglose de motivos en los logs cuando está en espera
             bloqueos = []
             if not cruce_alcista: bloqueos.append("15m < SMA")
             if not tendencia_1h_alcista: bloqueos.append(f"1h Bajista (SMA 1h: ${media_1h:,.0f})")
@@ -311,7 +370,7 @@ def bucle_trading():
 
 if __name__ == '__main__':
     if MONGO_URI:
-        print("=== BOT V6 INICIADO (Kraken + Trailing + Filtro MTF + RSI) ===", flush=True)
+        print("=== BOT V6 INICIADO (Kraken + Trailing + MTF + RSI + Dashboard V2) ===", flush=True)
         hilo_bot = threading.Thread(target=bucle_trading)
         hilo_bot.daemon = True
         hilo_bot.start()
