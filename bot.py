@@ -12,6 +12,7 @@ from datetime import datetime
 STOP_LOSS_PCT = 2.0
 TAKE_PROFIT_PCT = 4.0
 TRAILING_STOP_PCT = 1.5  # Distancia en % desde el máximo
+FEE_PCT = 0.26           # Comisión estimada por operación en Kraken (0.26% Spot Taker)
 
 # --- PARÁMETROS DE FILTROS ---
 RSI_PERIODO = 14
@@ -46,6 +47,7 @@ def obtener_estado():
             "_id": "estado_actual",
             "saldo_usd": 1000.0,
             "btc_poseidos": 0.0,
+            "capital_invertido_usd": 0.0,
             "precio_compra": 0.0,
             "en_posicion": False,
             "historial": [],
@@ -71,6 +73,8 @@ def obtener_estado():
         estado.update({"balance_history": [1000.0], "trades_ganadores": 0, "trades_perdedores": 0, "gross_profit": 0.0, "gross_loss": 0.0, "max_balance": estado.get("saldo_usd", 1000.0)})
     if "ultimo_precio" not in estado:
         estado.update({"ultimo_precio": 0.0, "ultima_sma_15m": 0.0, "ultima_sma_1h": 0.0, "ultimo_rsi": 0.0})
+    if "capital_invertido_usd" not in estado:
+        estado.update({"capital_invertido_usd": 0.0})
     return estado
 
 def guardar_estado(estado):
@@ -99,18 +103,26 @@ class WebHandler(BaseHTTPRequestHandler):
         profit_factor = (estado['gross_profit'] / estado['gross_loss']) if estado['gross_loss'] > 0 else (estado['gross_profit'] if estado['gross_profit'] > 0 else 0)
         
         precio_actual = estado.get('ultimo_precio', estado['precio_compra'])
-        saldo_actual = estado['saldo_usd'] if not estado['en_posicion'] else (estado['btc_poseidos'] * precio_actual)
+        
+        # Saldo NETA estimado si vendiéramos en este instante (descontando comisión de salida)
+        if estado['en_posicion']:
+            saldo_bruto_est = estado['btc_poseidos'] * precio_actual
+            saldo_actual = saldo_bruto_est * (1 - FEE_PCT / 100)
+        else:
+            saldo_actual = estado['saldo_usd']
+
         drawdown = ((estado['max_balance'] - saldo_actual) / estado['max_balance'] * 100) if estado['max_balance'] > 0 else 0
 
         # Colores dinámicos
         capital_color = "#00ff66" if saldo_actual >= 1000.0 else "#ff4444"
         pf_color = "#00ff66" if profit_factor >= 1.0 else "#ffb86c"
 
-        # PnL Abierto (Flotante)
-        if estado['en_posicion'] and estado['precio_compra'] > 0 and precio_actual > 0:
-            pnl_pct = ((precio_actual - estado['precio_compra']) / estado['precio_compra']) * 100
+        # PnL Abierto Neto (Tenido en cuenta comisiones de entrada y salida)
+        if estado['en_posicion'] and estado.get('capital_invertido_usd', 0) > 0:
+            capital_inv = estado['capital_invertido_usd']
+            pnl_pct = ((saldo_actual - capital_inv) / capital_inv) * 100
             pnl_color = "#00ff66" if pnl_pct >= 0 else "#ff4444"
-            pnl_str = f" <span style='color:{pnl_color}; font-size:13px; font-weight:bold;'>(PnL: {pnl_pct:+.2f}%)</span>"
+            pnl_str = f" <span style='color:{pnl_color}; font-size:13px; font-weight:bold;'>(PnL Neto: {pnl_pct:+.2f}%)</span>"
         else:
             pnl_str = ""
 
@@ -160,14 +172,14 @@ class WebHandler(BaseHTTPRequestHandler):
             <div class="grid-3">
                 <!-- TARJETA 1: CAPITAL & ESTADO -->
                 <div class="box">
-                    <div class="metric-title">Capital Actual</div>
+                    <div class="metric-title">Capital Actual (Neto)</div>
                     <div class="metric-value" style="color: {capital_color}">${saldo_actual:,.2f} USD</div>
                     <div class="sub-info">
                         Estado: {'🟢 EN POSICIÓN' if estado['en_posicion'] else '🔴 LÍQUIDO'}{pnl_str}
                     </div>
                 </div>
 
-                <!-- TARJETA 2: DESEMPETAÑA / MÉTRICAS -->
+                <!-- TARJETA 2: DESEMPEÑO / MÉTRICAS -->
                 <div class="box">
                     <div class="metric-title">Win Rate / Profit Factor</div>
                     <div class="metric-value" style="color: #ffffff">
@@ -180,7 +192,7 @@ class WebHandler(BaseHTTPRequestHandler):
 
                 <!-- TARJETA 3: MERCADO EN VIVO -->
                 <div class="box">
-                    <div class="metric-title">Mercado BTC en Vivo</div>
+                    <div class="metric-title">Mercado BTC (Fee: {FEE_PCT}%)</div>
                     <div class="metric-value" style="color: #ffffff">{btc_price_str}</div>
                     <div class="sub-info">
                         SMA 15m: {sma_15m_str} | 1h: {sma_1h_str} | RSI: {rsi_str}
@@ -209,7 +221,7 @@ class WebHandler(BaseHTTPRequestHandler):
                     data: {{
                         labels: labels,
                         datasets: [{{
-                            label: 'Evolución del Capital (USD)',
+                            label: 'Evolución del Capital Neto (USD)',
                             data: balances,
                             borderColor: '#00ff66',
                             backgroundColor: 'rgba(0, 255, 102, 0.08)',
@@ -245,7 +257,7 @@ def run_server():
 
 # --- LÓGICA DE TRADING ---
 def actualizar_estadisticas_venta(estado, saldo_obtenido, ganancia_usd):
-    """Actualiza las métricas cuando se cierra una posición."""
+    """Actualiza las métricas netas cuando se cierra una posición."""
     estado['balance_history'].append(saldo_obtenido)
     if saldo_obtenido > estado['max_balance']:
         estado['max_balance'] = saldo_obtenido
@@ -265,7 +277,7 @@ def analizar_y_operar():
     ohlcv_15m = exchange.fetch_ohlcv('BTC/USD', timeframe='15m', limit=50)
     df_15m = pd.DataFrame(ohlcv_15m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df_15m['sma_20'] = df_15m['close'].rolling(20).mean()
-    df_15m['vol_sma'] = df_15m['volume'].rolling(20).mean()  # Filtro de volumen institucional
+    df_15m['vol_sma'] = df_15m['volume'].rolling(20).mean()
     df_15m['rsi'] = calcular_rsi(df_15m['close'], period=RSI_PERIODO)
     
     # Datos en vivo (para gestión de posiciones y stops)
@@ -287,14 +299,18 @@ def analizar_y_operar():
 
     # Guardar estado de mercado para el dashboard
     estado['ultimo_precio'] = precio_actual 
-    estado['ultima_sma_15m'] = media_15m_actual  # Mostramos la media actual en vivo
+    estado['ultima_sma_15m'] = media_15m_actual
     estado['ultima_sma_1h'] = media_1h
     estado['ultimo_rsi'] = rsi_cerrado
 
     if estado['en_posicion']:
+        # Saldo bruto y neto descontando la comisión de venta
+        saldo_obtenido_bruto = estado['btc_poseidos'] * precio_actual
+        saldo_obtenido_neto = saldo_obtenido_bruto * (1 - FEE_PCT / 100)
+        
+        capital_invertido = estado.get('capital_invertido_usd', estado['btc_poseidos'] * estado['precio_compra'])
+        ganancia_usd = saldo_obtenido_neto - capital_invertido
         porcentaje_variacion = ((precio_actual - estado['precio_compra']) / estado['precio_compra']) * 100
-        saldo_obtenido = estado['btc_poseidos'] * precio_actual
-        ganancia_usd = saldo_obtenido - (estado['btc_poseidos'] * estado['precio_compra'])
 
         # Trailing Stop & Stop Loss dinámico evaluado en tiempo real
         precio_max_alcanzado = estado.get('precio_max_alcanzado', estado['precio_compra'])
@@ -309,38 +325,42 @@ def analizar_y_operar():
 
         # CONDICIONES DE SALIDA
         if porcentaje_variacion >= TAKE_PROFIT_PCT:
-            actualizar_estadisticas_venta(estado, saldo_obtenido, ganancia_usd)
-            estado['saldo_usd'] = saldo_obtenido
+            actualizar_estadisticas_venta(estado, saldo_obtenido_neto, ganancia_usd)
+            estado['saldo_usd'] = saldo_obtenido_neto
             estado['btc_poseidos'] = 0.0
+            estado['capital_invertido_usd'] = 0.0
             estado['en_posicion'] = False
             estado['precio_max_alcanzado'] = 0.0
             estado['stop_dinamico'] = 0.0
-            registrar_evento(estado, f"🎯 TAKE PROFIT (+{TAKE_PROFIT_PCT}%) | Venta: ${precio_actual:,.2f} | Ganancia: +${ganancia_usd:,.2f}")
+            registrar_evento(estado, f"🎯 TAKE PROFIT (+{TAKE_PROFIT_PCT}%) | Venta: ${precio_actual:,.2f} | Net PnL: ${ganancia_usd:+,.2f}")
 
         elif precio_actual <= stop_dinamico:
-            actualizar_estadisticas_venta(estado, saldo_obtenido, ganancia_usd)
-            estado['saldo_usd'] = saldo_obtenido
+            actualizar_estadisticas_venta(estado, saldo_obtenido_neto, ganancia_usd)
+            estado['saldo_usd'] = saldo_obtenido_neto
             estado['btc_poseidos'] = 0.0
+            estado['capital_invertido_usd'] = 0.0
             estado['en_posicion'] = False
             estado['precio_max_alcanzado'] = 0.0
             estado['stop_dinamico'] = 0.0
             
             if stop_dinamico == precio_trailing and precio_trailing > precio_stop_inicial:
-                registrar_evento(estado, f"🛡️ TRAILING STOP | Venta: ${precio_actual:,.2f} | Resultado: ${ganancia_usd:+,.2f}")
+                registrar_evento(estado, f"🛡️️ TRAILING STOP | Venta: ${precio_actual:,.2f} | Net PnL: ${ganancia_usd:+,.2f}")
             else:
-                registrar_evento(estado, f"🛑 STOP LOSS (-{STOP_LOSS_PCT}%) | Venta: ${precio_actual:,.2f} | Pérdida: -${abs(ganancia_usd):,.2f}")
+                registrar_evento(estado, f"🛑 STOP LOSS (-{STOP_LOSS_PCT}%) | Venta: ${precio_actual:,.2f} | Net PnL: ${ganancia_usd:+,.2f}")
 
         elif precio_actual < media_15m_actual:
-            actualizar_estadisticas_venta(estado, saldo_obtenido, ganancia_usd)
-            estado['saldo_usd'] = saldo_obtenido
+            actualizar_estadisticas_venta(estado, saldo_obtenido_neto, ganancia_usd)
+            estado['saldo_usd'] = saldo_obtenido_neto
             estado['btc_poseidos'] = 0.0
+            estado['capital_invertido_usd'] = 0.0
             estado['en_posicion'] = False
             estado['precio_max_alcanzado'] = 0.0
             estado['stop_dinamico'] = 0.0
-            registrar_evento(estado, f"🔴 VENTA (Bajo SMA 15m) | Venta: ${precio_actual:,.2f} | Resultado: ${ganancia_usd:+,.2f}")
+            registrar_evento(estado, f"🔴 VENTA (Bajo SMA 15m) | Venta: ${precio_actual:,.2f} | Net PnL: ${ganancia_usd:+,.2f}")
         
         else:
-            registrar_evento(estado, f"📦 Posición Activa | BTC: ${precio_actual:,.2f} | PnL: {porcentaje_variacion:+.2f}%")
+            pnl_neto_pct = ((saldo_obtenido_neto - capital_invertido) / capital_invertido) * 100
+            registrar_evento(estado, f"📦 Posición Activa | BTC: ${precio_actual:,.2f} | Net PnL: {pnl_neto_pct:+.2f}%")
 
     else:
         # CONDICIONES DE ENTRADA (4 FILTROS OBLIGATORIOS EVALUADOS EN VELA CERRADA)
@@ -350,17 +370,22 @@ def analizar_y_operar():
         volumen_optimo = volumen_cerrado > volumen_media_cerrada
 
         if cruce_alcista_confirmado and tendencia_1h_alcista and rsi_optimo and volumen_optimo:
-            estado['btc_poseidos'] = estado['saldo_usd'] / precio_actual
+            capital_entrada = estado['saldo_usd']
+            btc_comprados_brutos = capital_entrada / precio_actual
+            btc_comprados_netos = btc_comprados_brutos * (1 - FEE_PCT / 100)  # Deducción comisión compra
+            
+            estado['btc_poseidos'] = btc_comprados_netos
+            estado['capital_invertido_usd'] = capital_entrada
             estado['precio_compra'] = precio_actual
             estado['precio_max_alcanzado'] = precio_actual
             estado['stop_dinamico'] = precio_actual * (1 - STOP_LOSS_PCT / 100)
             estado['en_posicion'] = True
             estado['saldo_usd'] = 0.0
-            registrar_evento(estado, f"🟢 COMPRA | Entrada: ${precio_actual:,.2f} | Vol: OK | RSI: {rsi_cerrado:.1f}")
+            registrar_evento(estado, f"🟢 COMPRA | Entrada: ${precio_actual:,.2f} | Net BTC: {btc_comprados_netos:.6f} | Fee: {FEE_PCT}%")
         else:
             bloqueos = []
             if not cruce_alcista_confirmado: bloqueos.append("15m < SMA")
-            if not tendencia_1h_alcista: bloqueos.append(f"1h Bajista")
+            if not tendencia_1h_alcista: bloqueos.append("1h Bajista")
             if not rsi_optimo: bloqueos.append(f"RSI: {rsi_cerrado:.1f}")
             if not volumen_optimo: bloqueos.append("Vol bajo")
             
@@ -380,7 +405,7 @@ def bucle_trading():
 
 if __name__ == '__main__':
     if MONGO_URI:
-        print("=== BOT V7 INICIADO (Cierre de Vela + Filtro Volumen + Dashboard V2) ===", flush=True)
+        print(f"=== BOT V8 INICIADO (Kraken + Comisiones {FEE_PCT}% + Cierre Vela + Vol + Dashboard) ===", flush=True)
         hilo_bot = threading.Thread(target=bucle_trading)
         hilo_bot.daemon = True
         hilo_bot.start()
