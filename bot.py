@@ -1,6 +1,5 @@
 import os
 import time
-import json
 import threading
 import pandas as pd
 import ccxt
@@ -9,21 +8,26 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 
-# --- CONFIGURACIÓN DE RIESGO Y ESTRATEGIA ---
-PARES_OPERABLES = ['BTC/USD', 'ETH/USD', 'SOL/USD']  # Pares a escanear
-STOP_LOSS_PCT = 2.0
-TAKE_PROFIT_PCT = 4.0
-TRAILING_STOP_PCT = 1.5  # Distancia en % desde el máximo alcanzado
-FEE_PCT = 0.26           # Comisión estimada por operación en Kraken
+# --- CONFIGURACIÓN DE RIESGO Y ESTRATEGIA PRO ---
+PARES_OPERABLES = ['BTC/USD', 'ETH/USD', 'SOL/USD']
+FEE_PCT = 0.26                 # Comisión en Kraken
 
-# --- PARÁMETROS DE FILTROS ---
+# Gestión de Riesgo por Volatilidad (ATR)
+ATR_MULTIPLIER_STOP = 2.5      # El Stop Loss se coloca a 2.5 veces la volatilidad media
+ATR_MULTIPLIER_TRAILING = 1.5  # El bot persigue el precio a 1.5 veces la volatilidad
+TAKE_PROFIT_PCT = 5.0          # Take profit de emergencia para picos repentinos
+
+# Parámetros de Indicadores
 RSI_PERIODO = 14
-RSI_MIN = 50.0  # Mínimo impulso comprador
-RSI_MAX = 70.0  # Evita entrar sobrecomprado
+RSI_MIN = 50.0  
+RSI_MAX = 70.0  
 SMA_15M_PERIODO = 20
 SMA_1H_PERIODO = 20
+ADX_PERIODO = 14
+ADX_MIN = 25.0                 # Solo opera si hay tendencia fuerte
+VWAP_PERIODOS = 96             # VWAP rodante de 24 horas (96 velas de 15m)
 
-# --- CONEXIÓN A MONGODB CON FALLBACK SEGURO ---
+# --- CONEXIÓN A MONGODB ---
 MONGO_URI = os.environ.get("MONGO_URI")
 coleccion_estado = None
 
@@ -37,15 +41,13 @@ if MONGO_URI:
     except Exception as e:
         print(f"⚠️ Error conectando a MongoDB: {e}. Se usará memoria RAM.", flush=True)
         coleccion_estado = None
-else:
-    print("⚠️ MONGO_URI no configurado. Operando en modo memoria RAM.", flush=True)
 
-# Estado por defecto estructurado para Multipar
+# Estado por defecto
 estado_ram = {
     "_id": "estado_actual",
     "saldo_usd": 1000.0,
-    "cantidad_activa": 0.0,     # Cantidad de la moneda comprada
-    "par_activo": "",           # Almacena en qué moneda estamos invertidos
+    "cantidad_activa": 0.0,
+    "par_activo": "",
     "capital_invertido_usd": 0.0,
     "precio_compra": 0.0,
     "en_posicion": False,
@@ -58,17 +60,16 @@ estado_ram = {
     "max_balance": 1000.0,
     "precio_max_alcanzado": 0.0,
     "stop_dinamico": 0.0,
-    "mercado_actual": {par: {"precio": 0.0, "rsi": 0.0, "sma15": 0.0} for par in PARES_OPERABLES}
+    "mercado_actual": {par: {"precio": 0.0, "rsi": 0.0, "sma15": 0.0, "adx": 0.0, "vwap": 0.0, "atr": 0.0} for par in PARES_OPERABLES}
 }
 
-# Instancia global única de CCXT
 exchange_kraken = ccxt.kraken({
     'enableRateLimit': True,
     'timeout': 15000
 })
 
 
-# --- FUNCIONES AUXILIARES ---
+# --- FUNCIONES MATEMÁTICAS / INDICADORES (Puro Pandas) ---
 def calcular_rsi(series, period=14):
     delta = series.diff()
     gain = delta.clip(lower=0)
@@ -77,6 +78,31 @@ def calcular_rsi(series, period=14):
     ema_loss = loss.ewm(com=period - 1, adjust=False).mean()
     rs = ema_gain / ema_loss
     return 100 - (100 / (1 + rs))
+
+def calcular_adx_atr(df, period=14):
+    up = df['high'] - df['high'].shift(1)
+    down = df['low'].shift(1) - df['low']
+    
+    plus_dm = up.where((up > down) & (up > 0), 0.0)
+    minus_dm = down.where((down > up) & (down > 0), 0.0)
+    
+    tr1 = df['high'] - df['low']
+    tr2 = (df['high'] - df['close'].shift(1)).abs()
+    tr3 = (df['low'] - df['close'].shift(1)).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    
+    atr = tr.ewm(alpha=1/period, adjust=False).mean()
+    plus_di = 100 * (plus_dm.ewm(alpha=1/period, adjust=False).mean() / atr)
+    minus_di = 100 * (minus_dm.ewm(alpha=1/period, adjust=False).mean() / atr)
+    
+    dx = 100 * (abs(plus_di - minus_di) / (plus_di + minus_di))
+    adx = dx.ewm(alpha=1/period, adjust=False).mean()
+    return adx, atr
+
+def calcular_vwap(df, window=96):
+    typical_price = (df['high'] + df['low'] + df['close']) / 3
+    vwap = (typical_price * df['volume']).rolling(window=window).sum() / df['volume'].rolling(window=window).sum()
+    return vwap
 
 def obtener_hora_local():
     return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -89,28 +115,24 @@ def registrar_evento(mensaje):
     guardar_estado(estado)
 
 
-# --- FUNCIONES DE BASE DE DATOS ---
+# --- BASE DE DATOS ---
 def obtener_estado():
     global estado_ram
     if coleccion_estado is not None:
         try:
             doc = coleccion_estado.find_one({"_id": "estado_actual"})
             if doc:
-                # Migración de estados antiguos si venimos del bot mono-par
-                if "btc_poseidos" in doc:
-                    doc["cantidad_activa"] = doc.pop("btc_poseidos", 0)
-                    if doc.get("en_posicion", False) and not doc.get("par_activo"):
-                        doc["par_activo"] = "BTC/USD"
-                
-                # Migrar mercado_actual si no existe
+                # Estructura segura de mercado_actual para migraciones
                 if "mercado_actual" not in doc:
-                    doc["mercado_actual"] = {par: {"precio": 0.0, "rsi": 0.0, "sma15": 0.0} for par in PARES_OPERABLES}
+                    doc["mercado_actual"] = {}
+                for par in PARES_OPERABLES:
+                    if par not in doc["mercado_actual"]:
+                        doc["mercado_actual"][par] = {"precio": 0.0, "rsi": 0.0, "sma15": 0.0, "adx": 0.0, "vwap": 0.0, "atr": 0.0}
                 return doc
             else:
                 coleccion_estado.insert_one(estado_ram)
                 return estado_ram.copy()
-        except PyMongoError as e:
-            print(f"⚠️ Fallo al leer MongoDB: {e}. Usando RAM.", flush=True)
+        except PyMongoError:
             return estado_ram
     return estado_ram
 
@@ -119,36 +141,38 @@ def guardar_estado(estado):
     estado_ram = estado.copy()
     if coleccion_estado is not None:
         try:
-            coleccion_estado.update_one(
-                {"_id": "estado_actual"},
-                {"$set": estado},
-                upsert=True
-            )
-        except PyMongoError as e:
-            print(f"⚠️️ Fallo al guardar en MongoDB: {e}", flush=True)
+            coleccion_estado.update_one({"_id": "estado_actual"}, {"$set": estado}, upsert=True)
+        except PyMongoError:
+            pass
 
 
 # --- LÓGICA DE MERCADO ---
 def obtener_datos_mercado(par):
     try:
-        # Obtener datos de 15 minutos
-        ohlcv_15m = exchange_kraken.fetch_ohlcv(par, '15m', limit=100)
+        ohlcv_15m = exchange_kraken.fetch_ohlcv(par, '15m', limit=150)
         df_15m = pd.DataFrame(ohlcv_15m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df_15m['sma_15m'] = df_15m['close'].rolling(window=SMA_15M_PERIODO).mean()
         df_15m['rsi'] = calcular_rsi(df_15m['close'], RSI_PERIODO)
+        df_15m['vwap'] = calcular_vwap(df_15m, VWAP_PERIODOS)
+        
+        adx, atr = calcular_adx_atr(df_15m, ADX_PERIODO)
+        df_15m['adx'] = adx
+        df_15m['atr'] = atr
 
-        # Obtener datos de 1 hora
         ohlcv_1h = exchange_kraken.fetch_ohlcv(par, '1h', limit=50)
         df_1h = pd.DataFrame(ohlcv_1h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df_1h['sma_1h'] = df_1h['close'].rolling(window=SMA_1H_PERIODO).mean()
 
-        if len(df_15m) < SMA_15M_PERIODO or len(df_1h) < SMA_1H_PERIODO:
+        if len(df_15m) < VWAP_PERIODOS or df_15m.isna().iloc[-1].any():
             return None
 
         return {
             'precio_actual': float(df_15m.iloc[-1]['close']),
             'sma_15m': float(df_15m.iloc[-1]['sma_15m']),
             'rsi': float(df_15m.iloc[-1]['rsi']),
+            'adx': float(df_15m.iloc[-1]['adx']),
+            'vwap': float(df_15m.iloc[-1]['vwap']),
+            'atr': float(df_15m.iloc[-1]['atr']),
             'sma_1h': float(df_1h.iloc[-1]['sma_1h'])
         }
     except Exception as e:
@@ -156,7 +180,7 @@ def obtener_datos_mercado(par):
         return None
 
 
-def simular_operacion(tipo, par, precio, cantidad_usd):
+def simular_operacion(tipo, par, precio, cantidad_usd, atr_actual=0.0):
     estado = obtener_estado()
     fee = cantidad_usd * (FEE_PCT / 100.0)
     
@@ -171,9 +195,10 @@ def simular_operacion(tipo, par, precio, cantidad_usd):
         estado['precio_compra'] = precio
         
         estado['precio_max_alcanzado'] = precio
-        estado['stop_dinamico'] = precio * (1.0 - STOP_LOSS_PCT/100.0)
+        # Stop Loss Dinámico Inicial basado en la volatilidad real del activo (ATR)
+        estado['stop_dinamico'] = precio - (atr_actual * ATR_MULTIPLIER_STOP)
         
-        registrar_evento(f"🟢 COMPRA {par} | Precio: {precio:.2f} USD | Inversión: {cantidad_usd:.2f} USD")
+        registrar_evento(f"🟢 COMPRA {par} | P: {precio:.2f} | Inversión: {cantidad_usd:.2f} | Stop Inicial: {estado['stop_dinamico']:.2f}")
         
     elif tipo in ['VENTA_STOP', 'VENTA_PROFIT', 'VENTA_TRAILING']:
         valor_bruto_venta = estado['cantidad_activa'] * precio
@@ -197,9 +222,8 @@ def simular_operacion(tipo, par, precio, cantidad_usd):
             estado['gross_loss'] += abs(beneficio_trade)
             icono = "🛑 STOP LOSS" if tipo == 'VENTA_STOP' else "🛡️ TRAILING STOP"
             
-        registrar_evento(f"{icono} {par} | Precio: {precio:.2f} USD | Retorno: {retorno_neto:.2f} USD | B/P: {beneficio_trade:.2f} USD")
+        registrar_evento(f"{icono} {par} | Venta: {precio:.2f} | Retorno: {retorno_neto:.2f} | B/P: {beneficio_trade:.2f} USD")
         
-        # Reset variables
         estado['en_posicion'] = False
         estado['par_activo'] = ""
         estado['cantidad_activa'] = 0.0
@@ -214,36 +238,34 @@ def simular_operacion(tipo, par, precio, cantidad_usd):
 def analizar_y_operar():
     estado = obtener_estado()
     
-    # --- RUTA 1: ESTAMOS EN POSICIÓN (Vigilamos solo el par comprado) ---
     if estado['en_posicion']:
         par = estado['par_activo']
         datos = obtener_datos_mercado(par)
         if not datos: return
         
         precio = datos['precio_actual']
+        atr = datos['atr']
         
-        # Actualizar datos para el dashboard web
         estado['mercado_actual'][par] = {
-            "precio": precio, "rsi": datos['rsi'], "sma15": datos['sma_15m']
+            "precio": precio, "rsi": datos['rsi'], "sma15": datos['sma_15m'], 
+            "adx": datos['adx'], "vwap": datos['vwap'], "atr": atr
         }
         guardar_estado(estado)
 
-        # Actualizar Trailing Stop
+        # Trailing Stop ajustado por Volatilidad (ATR)
         if precio > estado['precio_max_alcanzado']:
             estado['precio_max_alcanzado'] = precio
-            nuevo_stop = precio * (1.0 - TRAILING_STOP_PCT/100.0)
+            nuevo_stop = precio - (atr * ATR_MULTIPLIER_TRAILING)
             if nuevo_stop > estado['stop_dinamico']:
                 estado['stop_dinamico'] = nuevo_stop
-                registrar_evento(f"🔒 Trailing Stop ajustado al alza en {par}: {nuevo_stop:.2f} USD")
+                registrar_evento(f"🔒 Trailing ATR ajustado en {par}: {nuevo_stop:.2f}")
                 guardar_estado(estado)
 
-        # Condiciones de Venta
         if precio <= estado['stop_dinamico']:
             simular_operacion('VENTA_TRAILING' if estado['stop_dinamico'] > estado['precio_compra'] else 'VENTA_STOP', par, precio, 0)
         elif precio >= estado['precio_compra'] * (1.0 + TAKE_PROFIT_PCT/100.0):
             simular_operacion('VENTA_PROFIT', par, precio, 0)
              
-    # --- RUTA 2: ESTAMOS LÍQUIDOS (Escaneamos todos los pares en busca de entradas) ---
     else:
         for par in PARES_OPERABLES:
             datos = obtener_datos_mercado(par)
@@ -253,23 +275,26 @@ def analizar_y_operar():
             sma_15m = datos['sma_15m']
             sma_1h = datos['sma_1h']
             rsi = datos['rsi']
+            adx = datos['adx']
+            vwap = datos['vwap']
+            atr = datos['atr']
             
-            # Actualizar datos del panel web
             estado['mercado_actual'][par] = {
-                "precio": precio, "rsi": rsi, "sma15": sma_15m
+                "precio": precio, "rsi": rsi, "sma15": sma_15m, 
+                "adx": adx, "vwap": vwap, "atr": atr
             }
             guardar_estado(estado)
             
+            # FILTROS PRO DE ENTRADA
             tendencia_15m = precio > sma_15m
             tendencia_1h = precio > sma_1h
             impulso_rsi = RSI_MIN < rsi < RSI_MAX
+            fuerza_tendencia = adx > ADX_MIN            # El mercado tiene que estar en movimiento claro
+            confirmacion_volumen = precio > vwap        # Dinero institucional respaldando la subida
             
-            if tendencia_15m and tendencia_1h and impulso_rsi:
-                # ¡Señal encontrada! Compramos y bloqueamos el escáner
-                simular_operacion('COMPRA', par, precio, estado['saldo_usd'])
-                break # Rompe el for para no comprar otros pares en el mismo ciclo
-            else:
-                print(f"[{obtener_hora_local()}] {par} -> No hay señal (P:{precio:.1f} | 15m:{tendencia_15m} | 1h:{tendencia_1h} | RSI:{rsi:.1f})")
+            if tendencia_15m and tendencia_1h and impulso_rsi and fuerza_tendencia and confirmacion_volumen:
+                simular_operacion('COMPRA', par, precio, estado['saldo_usd'], atr)
+                break 
 
 
 # --- SERVIDOR WEB ---
@@ -279,7 +304,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Quant Bot | Dashboard Pro</title>
+    <title>Quant Bot | Pro Analytics</title>
     <meta http-equiv="refresh" content="15">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
     <style>
@@ -312,9 +337,9 @@ HTML_TEMPLATE = """
         .text-warning {{ color: var(--warning); }}
         .active-trade {{ background: linear-gradient(145deg, rgba(16,185,129,0.08) 0%, rgba(21,26,35,1) 100%); border: 1px solid var(--success); }}
         .market-card {{ display: flex; flex-direction: column; gap: 10px; }}
-        .market-row {{ display: flex; justify-content: space-between; align-items: center; border-bottom: 1px dashed var(--border); padding-bottom: 8px; }}
+        .market-row {{ display: flex; justify-content: space-between; align-items: center; border-bottom: 1px dashed var(--border); padding-bottom: 8px; font-size: 0.9rem; }}
         .market-row:last-child {{ border-bottom: none; padding-bottom: 0; }}
-        .badge {{ padding: 4px 10px; border-radius: 6px; font-size: 0.75rem; font-weight: 800; letter-spacing: 0.5px;}}
+        .badge {{ padding: 4px 10px; border-radius: 6px; font-size: 0.75rem; font-weight: 800; letter-spacing: 0.5px; text-transform: uppercase; }}
         .section-title {{ font-size: 1.2rem; border-bottom: 1px solid var(--border); padding-bottom: 10px; margin: 35px 0 15px 0; display: flex; align-items: center; gap: 8px;}}
         .logs-container {{ background: #000; border: 1px solid var(--border); border-radius: 12px; padding: 15px; height: 300px; overflow-y: auto; font-family: 'Consolas', 'Courier New', monospace; font-size: 0.85rem; color: #a9b1d6; box-shadow: inset 0 2px 10px rgba(0,0,0,0.5);}}
         .log-line {{ margin-bottom: 8px; padding-bottom: 8px; border-bottom: 1px solid #1a1b26; line-height: 1.4; }}
@@ -330,7 +355,7 @@ HTML_TEMPLATE = """
         <div class="header">
             <h1>
                 <span class="status-dot {dot_class}"></span>
-                Panel Cuantitativo
+                Panel Cuantitativo Avanzado
             </h1>
             <div style="text-align: right; color: var(--text-muted); font-size: 0.85rem; font-family: monospace;">
                 Última actualización: {hora_actual}
@@ -358,7 +383,7 @@ HTML_TEMPLATE = """
 
         {posicion_html}
 
-        <h2 class="section-title">📡 Escáner de Mercado</h2>
+        <h2 class="section-title">📡 Matriz de Análisis</h2>
         <div class="grid-3">
             {mercado_html}
         </div>
@@ -373,8 +398,7 @@ HTML_TEMPLATE = """
 """
 
 class WebDashboardHandler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        pass # Suprimir logs de peticiones HTTP en la consola para no ensuciar
+    def log_message(self, format, *args): pass 
 
     def do_GET(self):
         self.send_response(200)
@@ -404,56 +428,64 @@ class WebDashboardHandler(BaseHTTPRequestHandler):
                     <div><span style="color: var(--text-muted); font-size: 0.85rem;">Precio de Compra</span><br><strong>${estado['precio_compra']:,.2f}</strong></div>
                     <div><span style="color: var(--text-muted); font-size: 0.85rem;">Precio Actual</span><br><strong>${precio_actual:,.2f}</strong></div>
                     <div><span style="color: var(--text-muted); font-size: 0.85rem;">P&L Abierto</span><br><strong class="{pnl_class}">{pnl:+.2f}%</strong></div>
-                    <div><span style="color: var(--text-muted); font-size: 0.85rem;">Stop Dinámico Actual</span><br><strong class="text-danger">${estado['stop_dinamico']:,.2f}</strong></div>
+                    <div><span style="color: var(--text-muted); font-size: 0.85rem;">Stop ATR Dinámico</span><br><strong class="text-danger">${estado['stop_dinamico']:,.2f}</strong></div>
                 </div>
             </div>
             """
         else:
-            estado_str = "LÍQUIDO / ESPERA"
+            estado_str = "ESCANEO ACTIVO"
             dot_class = "dot-waiting"
             text_status_class = "text-warning"
             equidad = estado['saldo_usd']
             pos_html = ""
 
-        # Construir bloques de mercado con inteligencia de colores
         mercado_bloques = ""
         for par, datos in estado['mercado_actual'].items():
             is_active = (par == estado.get('par_activo'))
             active_style = "border-color: var(--success);" if is_active else ""
             
-            # Lógica de color RSI
-            rsi = datos['rsi']
-            if rsi > 65: rsi_color, rsi_text = "var(--danger)", "#fff"
+            rsi = datos.get('rsi', 0)
+            if rsi > 70: rsi_color, rsi_text = "var(--danger)", "#fff"
             elif rsi > 50: rsi_color, rsi_text = "var(--success)", "#fff"
             else: rsi_color, rsi_text = "#2a2e39", "var(--text-main)"
             
-            # Lógica de color Tendencia
-            tendencia = "ALCISTA" if datos['precio'] > datos['sma15'] else "BAJISTA"
-            tendencia_color = "var(--success)" if tendencia == "ALCISTA" else "var(--danger)"
+            adx = datos.get('adx', 0)
+            if adx > 25: adx_color, adx_label = "var(--success)", "Fuerte"
+            else: adx_color, adx_label = "#2a2e39", "Débil/Lateral"
+            
+            vwap = datos.get('vwap', 0)
+            precio = datos.get('precio', 0)
+            if precio > vwap: vwap_color, vwap_label = "var(--success)", "Soporte (Alcista)"
+            else: vwap_color, vwap_label = "var(--danger)", "Resistencia (Bajista)"
 
             mercado_bloques += f"""
             <div class="card market-card" style="{active_style}">
-                <div style="font-size: 1.2rem; font-weight: 800; margin-bottom: 5px; color: {'var(--success)' if is_active else 'var(--text-main)'};">
-                    {par} { '🎯' if is_active else ''}
+                <div style="font-size: 1.2rem; font-weight: 800; margin-bottom: 5px; color: {'var(--success)' if is_active else 'var(--text-main)'}; display:flex; justify-content:space-between;">
+                    <span>{par}</span>
+                    <span style="font-size:0.9rem; color:var(--text-muted); font-weight:400;">Vol. ATR: ${datos.get('atr', 0):.2f}</span>
                 </div>
                 
                 <div class="market-row">
-                    <span style="color: var(--text-muted);">Precio Actual:</span>
-                    <strong>${datos['precio']:,.2f}</strong>
+                    <span style="color: var(--text-muted);">Cotización:</span>
+                    <strong>${precio:,.2f}</strong>
                 </div>
                 <div class="market-row">
-                    <span style="color: var(--text-muted);">Fuerza (RSI 14):</span>
+                    <span style="color: var(--text-muted);">Fuerza Tendencial (ADX):</span>
+                    <span class="badge" style="background: {adx_color}; color: #fff;">{adx:.1f} - {adx_label}</span>
+                </div>
+                <div class="market-row">
+                    <span style="color: var(--text-muted);">Momentum (RSI):</span>
                     <span class="badge" style="background: {rsi_color}; color: {rsi_text};">{rsi:.1f}</span>
                 </div>
                 <div class="market-row">
-                    <span style="color: var(--text-muted);">Tendencia Corta:</span>
-                    <span class="badge" style="background: {tendencia_color}; color: #fff;">{tendencia}</span>
+                    <span style="color: var(--text-muted);">Estructura Volumen (VWAP):</span>
+                    <span class="badge" style="background: {vwap_color}; color: #fff;">{vwap_label}</span>
                 </div>
             </div>
             """
 
         historial = "".join([f"<div class='log-line'>{linea}</div>" for linea in estado['historial']])
-        if not historial: historial = "<div class='log-line'>Sin eventos recientes... Esperando iniciar ciclo.</div>"
+        if not historial: historial = "<div class='log-line'>Sistema inicializado. Analizando mercados...</div>"
 
         html_final = HTML_TEMPLATE.format(
             hora_actual=obtener_hora_local(),
@@ -474,25 +506,18 @@ class WebDashboardHandler(BaseHTTPRequestHandler):
 def iniciar_servidor_web():
     port = int(os.environ.get("PORT", 8080))
     server = ThreadingHTTPServer(('0.0.0.0', port), WebDashboardHandler)
-    print(f"✓ Panel web PRO iniciado en el puerto {port}", flush=True)
+    print(f"✓ Matriz PRO iniciada en puerto {port}", flush=True)
     server.serve_forever()
 
 
-# --- ARRANQUE PRINCIPAL ---
 if __name__ == "__main__":
-    print(f"=== INICIANDO BOT QUANT MULTI-PAIR ===", flush=True)
-    print(f"Pares objetivo: {PARES_OPERABLES}", flush=True)
-    
-    # Iniciar servidor web en hilo separado
+    print(f"=== INICIANDO QUANT ENGINE V2 ===", flush=True)
     threading.Thread(target=iniciar_servidor_web, daemon=True).start()
 
-    # Bucle principal de ejecución (ciclo cada 2 minutos)
     while True:
         try:
             analizar_y_operar()
         except Exception as e:
-            print(f"[{obtener_hora_local()}] ❌ Error crítico en el ciclo principal: {e}", flush=True)
+            print(f"[{obtener_hora_local()}] ❌ Error crítico: {e}", flush=True)
             time.sleep(10)
-        
-        # Pausa antes del siguiente escaneo (120 segundos)
         time.sleep(120)
