@@ -44,7 +44,7 @@ else:
 estado_ram = {
     "_id": "estado_actual",
     "saldo_usd": 1000.0,
-    "cantidad_activa": 0.0,     # Cantidad de la moneda comprada (ej. tokens de SOL o BTC)
+    "cantidad_activa": 0.0,     # Cantidad de la moneda comprada
     "par_activo": "",           # Almacena en qué moneda estamos invertidos
     "capital_invertido_usd": 0.0,
     "precio_compra": 0.0,
@@ -85,7 +85,7 @@ def registrar_evento(mensaje):
     print(f"[{obtener_hora_local()}] {mensaje}", flush=True)
     estado = obtener_estado()
     estado['historial'].insert(0, f"[{obtener_hora_local()}] {mensaje}")
-    estado['historial'] = estado['historial'][:30]
+    estado['historial'] = estado['historial'][:40]
     guardar_estado(estado)
 
 
@@ -96,7 +96,7 @@ def obtener_estado():
         try:
             doc = coleccion_estado.find_one({"_id": "estado_actual"})
             if doc:
-                # Migración de estados antiguos (si venimos del bot mono-par)
+                # Migración de estados antiguos si venimos del bot mono-par
                 if "btc_poseidos" in doc:
                     doc["cantidad_activa"] = doc.pop("btc_poseidos", 0)
                     if doc.get("en_posicion", False) and not doc.get("par_activo"):
@@ -125,7 +125,7 @@ def guardar_estado(estado):
                 upsert=True
             )
         except PyMongoError as e:
-            print(f"⚠️ Fallo al guardar en MongoDB: {e}", flush=True)
+            print(f"⚠️️ Fallo al guardar en MongoDB: {e}", flush=True)
 
 
 # --- LÓGICA DE MERCADO ---
@@ -212,7 +212,6 @@ def simular_operacion(tipo, par, precio, cantidad_usd):
 
 
 def analizar_y_operar():
-    print(f"[{obtener_hora_local()}] Iniciando ciclo de análisis...", flush=True)
     estado = obtener_estado()
     
     # --- RUTA 1: ESTAMOS EN POSICIÓN (Vigilamos solo el par comprado) ---
@@ -243,9 +242,6 @@ def analizar_y_operar():
             simular_operacion('VENTA_TRAILING' if estado['stop_dinamico'] > estado['precio_compra'] else 'VENTA_STOP', par, precio, 0)
         elif precio >= estado['precio_compra'] * (1.0 + TAKE_PROFIT_PCT/100.0):
             simular_operacion('VENTA_PROFIT', par, precio, 0)
-        elif precio < datos['sma_15m'] and precio > estado['precio_compra']:
-             registrar_evento(f"⚠️ Pérdida de SMA 15m en ganancias. Ajustando stop por seguridad.")
-             # Lógica opcional para estrechar el stop si pierde la media estando en positivo
              
     # --- RUTA 2: ESTAMOS LÍQUIDOS (Escaneamos todos los pares en busca de entradas) ---
     else:
@@ -269,12 +265,12 @@ def analizar_y_operar():
             impulso_rsi = RSI_MIN < rsi < RSI_MAX
             
             if tendencia_15m and tendencia_1h and impulso_rsi:
-                # ¡Señal encontrada! Compramos y bloqueamos el escáner al estar en posición
+                # ¡Señal encontrada! Compramos y bloqueamos el escáner
                 simular_operacion('COMPRA', par, precio, estado['saldo_usd'])
                 break # Rompe el for para no comprar otros pares en el mismo ciclo
             else:
                 print(f"[{obtener_hora_local()}] {par} -> No hay señal (P:{precio:.1f} | 15m:{tendencia_15m} | 1h:{tendencia_1h} | RSI:{rsi:.1f})")
-                
+
 
 # --- SERVIDOR WEB ---
 HTML_TEMPLATE = """
@@ -287,7 +283,7 @@ HTML_TEMPLATE = """
     <meta http-equiv="refresh" content="15">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
     <style>
-        :root {
+        :root {{
             --bg-dark: #0b0e14;
             --bg-card: #151a23;
             --text-main: #f0f4f8;
@@ -297,36 +293,36 @@ HTML_TEMPLATE = """
             --danger: #ef4444;
             --warning: #f59e0b;
             --border: #2a2e39;
-        }
-        body { font-family: 'Inter', sans-serif; background: var(--bg-dark); color: var(--text-main); margin: 0; padding: 20px; }
-        .container { max-width: 1200px; margin: 0 auto; }
-        .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); padding-bottom: 20px; margin-bottom: 20px; flex-wrap: wrap; gap: 15px;}
-        .header h1 { margin: 0; font-size: 1.8rem; font-weight: 800; display: flex; align-items: center; gap: 12px; }
-        .status-dot { height: 14px; width: 14px; border-radius: 50%; display: inline-block; box-shadow: 0 0 10px currentColor; }
-        .dot-active { color: var(--success); background: var(--success); }
-        .dot-waiting { color: var(--warning); background: var(--warning); }
-        .grid-4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 15px; margin-bottom: 20px; }
-        .grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 15px; margin-bottom: 20px; }
-        .card { background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; padding: 20px; transition: transform 0.2s; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
-        .card:hover { border-color: var(--text-muted); }
-        .card-title { font-size: 0.85rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 10px; font-weight: 600; }
-        .card-value { font-size: 1.8rem; font-weight: 800; margin: 0; }
-        .text-success { color: var(--success); }
-        .text-danger { color: var(--danger); }
-        .text-warning { color: var(--warning); }
-        .active-trade { background: linear-gradient(145deg, rgba(16,185,129,0.08) 0%, rgba(21,26,35,1) 100%); border: 1px solid var(--success); }
-        .market-card { display: flex; flex-direction: column; gap: 10px; }
-        .market-row { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px dashed var(--border); padding-bottom: 8px; }
-        .market-row:last-child { border-bottom: none; padding-bottom: 0; }
-        .badge { padding: 4px 10px; border-radius: 6px; font-size: 0.75rem; font-weight: 800; letter-spacing: 0.5px;}
-        .section-title { font-size: 1.2rem; border-bottom: 1px solid var(--border); padding-bottom: 10px; margin: 35px 0 15px 0; display: flex; align-items: center; gap: 8px;}
-        .logs-container { background: #000; border: 1px solid var(--border); border-radius: 12px; padding: 15px; height: 300px; overflow-y: auto; font-family: 'Consolas', 'Courier New', monospace; font-size: 0.85rem; color: #a9b1d6; box-shadow: inset 0 2px 10px rgba(0,0,0,0.5);}
-        .log-line { margin-bottom: 8px; padding-bottom: 8px; border-bottom: 1px solid #1a1b26; line-height: 1.4; }
-        .log-line:last-child { border: none; }
-        ::-webkit-scrollbar { width: 8px; }
-        ::-webkit-scrollbar-track { background: var(--bg-dark); }
-        ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
-        ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+        }}
+        body {{ font-family: 'Inter', sans-serif; background: var(--bg-dark); color: var(--text-main); margin: 0; padding: 20px; }}
+        .container {{ max-width: 1200px; margin: 0 auto; }}
+        .header {{ display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); padding-bottom: 20px; margin-bottom: 20px; flex-wrap: wrap; gap: 15px;}}
+        .header h1 {{ margin: 0; font-size: 1.8rem; font-weight: 800; display: flex; align-items: center; gap: 12px; }}
+        .status-dot {{ height: 14px; width: 14px; border-radius: 50%; display: inline-block; box-shadow: 0 0 10px currentColor; }}
+        .dot-active {{ color: var(--success); background: var(--success); }}
+        .dot-waiting {{ color: var(--warning); background: var(--warning); }}
+        .grid-4 {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 15px; margin-bottom: 20px; }}
+        .grid-3 {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 15px; margin-bottom: 20px; }}
+        .card {{ background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; padding: 20px; transition: transform 0.2s; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
+        .card:hover {{ border-color: var(--text-muted); }}
+        .card-title {{ font-size: 0.85rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 10px; font-weight: 600; }}
+        .card-value {{ font-size: 1.8rem; font-weight: 800; margin: 0; }}
+        .text-success {{ color: var(--success); }}
+        .text-danger {{ color: var(--danger); }}
+        .text-warning {{ color: var(--warning); }}
+        .active-trade {{ background: linear-gradient(145deg, rgba(16,185,129,0.08) 0%, rgba(21,26,35,1) 100%); border: 1px solid var(--success); }}
+        .market-card {{ display: flex; flex-direction: column; gap: 10px; }}
+        .market-row {{ display: flex; justify-content: space-between; align-items: center; border-bottom: 1px dashed var(--border); padding-bottom: 8px; }}
+        .market-row:last-child {{ border-bottom: none; padding-bottom: 0; }}
+        .badge {{ padding: 4px 10px; border-radius: 6px; font-size: 0.75rem; font-weight: 800; letter-spacing: 0.5px;}}
+        .section-title {{ font-size: 1.2rem; border-bottom: 1px solid var(--border); padding-bottom: 10px; margin: 35px 0 15px 0; display: flex; align-items: center; gap: 8px;}}
+        .logs-container {{ background: #000; border: 1px solid var(--border); border-radius: 12px; padding: 15px; height: 300px; overflow-y: auto; font-family: 'Consolas', 'Courier New', monospace; font-size: 0.85rem; color: #a9b1d6; box-shadow: inset 0 2px 10px rgba(0,0,0,0.5);}}
+        .log-line {{ margin-bottom: 8px; padding-bottom: 8px; border-bottom: 1px solid #1a1b26; line-height: 1.4; }}
+        .log-line:last-child {{ border: none; }}
+        ::-webkit-scrollbar {{ width: 8px; }}
+        ::-webkit-scrollbar-track {{ background: var(--bg-dark); }}
+        ::-webkit-scrollbar-thumb {{ background: var(--border); border-radius: 4px; }}
+        ::-webkit-scrollbar-thumb:hover {{ background: var(--text-muted); }}
     </style>
 </head>
 <body>
@@ -405,10 +401,10 @@ class WebDashboardHandler(BaseHTTPRequestHandler):
             <div class="card active-trade" style="margin-bottom: 20px;">
                 <div class="card-title" style="color: var(--success); font-size: 1rem;">🟢 OPERACIÓN ACTIVA: {estado['par_activo']}</div>
                 <div class="grid-4" style="margin-bottom: 0;">
-                    <div><span style="color: var(--text-muted); font-size: 0.85rem;">Precio de Compra</span><br><strong>${estado['precio_compra']:.2f}</strong></div>
-                    <div><span style="color: var(--text-muted); font-size: 0.85rem;">Precio Actual</span><br><strong>${precio_actual:.2f}</strong></div>
+                    <div><span style="color: var(--text-muted); font-size: 0.85rem;">Precio de Compra</span><br><strong>${estado['precio_compra']:,.2f}</strong></div>
+                    <div><span style="color: var(--text-muted); font-size: 0.85rem;">Precio Actual</span><br><strong>${precio_actual:,.2f}</strong></div>
                     <div><span style="color: var(--text-muted); font-size: 0.85rem;">P&L Abierto</span><br><strong class="{pnl_class}">{pnl:+.2f}%</strong></div>
-                    <div><span style="color: var(--text-muted); font-size: 0.85rem;">Stop Loss Dinámico</span><br><strong class="text-danger">${estado['stop_dinamico']:.2f}</strong></div>
+                    <div><span style="color: var(--text-muted); font-size: 0.85rem;">Stop Dinámico Actual</span><br><strong class="text-danger">${estado['stop_dinamico']:,.2f}</strong></div>
                 </div>
             </div>
             """
@@ -443,7 +439,7 @@ class WebDashboardHandler(BaseHTTPRequestHandler):
                 
                 <div class="market-row">
                     <span style="color: var(--text-muted);">Precio Actual:</span>
-                    <strong>${datos['precio']:.2f}</strong>
+                    <strong>${datos['precio']:,.2f}</strong>
                 </div>
                 <div class="market-row">
                     <span style="color: var(--text-muted);">Fuerza (RSI 14):</span>
