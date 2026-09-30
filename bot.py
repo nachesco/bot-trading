@@ -279,65 +279,98 @@ def analizar_y_operar():
 # --- SERVIDOR WEB ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
-<html>
+<html lang="es">
 <head>
-    <title>Multi-Pair Quant Bot</title>
-    <meta http-equiv="refresh" content="10">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Quant Bot | Dashboard Pro</title>
+    <meta http-equiv="refresh" content="15">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
     <style>
-        body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #121212; color: #e0e0e0; margin: 20px; }}
-        .card {{ background-color: #1e1e1e; padding: 20px; border-radius: 8px; margin-bottom: 20px; border-left: 4px solid #bb86fc; }}
-        .header {{ display: flex; justify-content: space-between; align-items: center; }}
-        .positive {{ color: #4caf50; font-weight: bold; }}
-        .negative {{ color: #f44336; font-weight: bold; }}
-        .neutral {{ color: #03a9f4; font-weight: bold; }}
-        h1, h2 {{ margin-top: 0; }}
-        ul {{ list-style-type: none; padding-left: 0; }}
-        li {{ background-color: #2c2c2c; margin: 5px 0; padding: 10px; border-radius: 4px; font-family: monospace; font-size: 0.9em; }}
-        .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; }}
+        :root {
+            --bg-dark: #0b0e14;
+            --bg-card: #151a23;
+            --text-main: #f0f4f8;
+            --text-muted: #8b9bb4;
+            --accent: #3b82f6;
+            --success: #10b981;
+            --danger: #ef4444;
+            --warning: #f59e0b;
+            --border: #2a2e39;
+        }
+        body { font-family: 'Inter', sans-serif; background: var(--bg-dark); color: var(--text-main); margin: 0; padding: 20px; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); padding-bottom: 20px; margin-bottom: 20px; flex-wrap: wrap; gap: 15px;}
+        .header h1 { margin: 0; font-size: 1.8rem; font-weight: 800; display: flex; align-items: center; gap: 12px; }
+        .status-dot { height: 14px; width: 14px; border-radius: 50%; display: inline-block; box-shadow: 0 0 10px currentColor; }
+        .dot-active { color: var(--success); background: var(--success); }
+        .dot-waiting { color: var(--warning); background: var(--warning); }
+        .grid-4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 15px; margin-bottom: 20px; }
+        .grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 15px; margin-bottom: 20px; }
+        .card { background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; padding: 20px; transition: transform 0.2s; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        .card:hover { border-color: var(--text-muted); }
+        .card-title { font-size: 0.85rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 10px; font-weight: 600; }
+        .card-value { font-size: 1.8rem; font-weight: 800; margin: 0; }
+        .text-success { color: var(--success); }
+        .text-danger { color: var(--danger); }
+        .text-warning { color: var(--warning); }
+        .active-trade { background: linear-gradient(145deg, rgba(16,185,129,0.08) 0%, rgba(21,26,35,1) 100%); border: 1px solid var(--success); }
+        .market-card { display: flex; flex-direction: column; gap: 10px; }
+        .market-row { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px dashed var(--border); padding-bottom: 8px; }
+        .market-row:last-child { border-bottom: none; padding-bottom: 0; }
+        .badge { padding: 4px 10px; border-radius: 6px; font-size: 0.75rem; font-weight: 800; letter-spacing: 0.5px;}
+        .section-title { font-size: 1.2rem; border-bottom: 1px solid var(--border); padding-bottom: 10px; margin: 35px 0 15px 0; display: flex; align-items: center; gap: 8px;}
+        .logs-container { background: #000; border: 1px solid var(--border); border-radius: 12px; padding: 15px; height: 300px; overflow-y: auto; font-family: 'Consolas', 'Courier New', monospace; font-size: 0.85rem; color: #a9b1d6; box-shadow: inset 0 2px 10px rgba(0,0,0,0.5);}
+        .log-line { margin-bottom: 8px; padding-bottom: 8px; border-bottom: 1px solid #1a1b26; line-height: 1.4; }
+        .log-line:last-child { border: none; }
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: var(--bg-dark); }
+        ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
     </style>
 </head>
 <body>
-    <div class="header">
-        <h1>🚀 Quant Bot (Multi-Pair)</h1>
-        <p>Actualizado: {hora_actual}</p>
-    </div>
-
-    <div class="card">
-        <h2>📊 Resumen de Cuenta</h2>
-        <div class="grid">
-            <div>
-                <p>Estado Operativo:</p>
-                <h3 class="{estado_class}">{estado_str}</h3>
-            </div>
-            <div>
-                <p>Saldo Disponible:</p>
-                <h3>{saldo_usd} USD</h3>
-            </div>
-            <div>
-                <p>Equidad Total Estimada:</p>
-                <h3>{equidad_estimada} USD</h3>
-            </div>
-            <div>
-                <p>Win Rate:</p>
-                <h3>{win_rate}%</h3>
+    <div class="container">
+        <div class="header">
+            <h1>
+                <span class="status-dot {dot_class}"></span>
+                Panel Cuantitativo
+            </h1>
+            <div style="text-align: right; color: var(--text-muted); font-size: 0.85rem; font-family: monospace;">
+                Última actualización: {hora_actual}
             </div>
         </div>
-    </div>
-    
-    <div class="card">
-        <h2>📡 Monitoreo de Mercado</h2>
-        <div class="grid">
+
+        <div class="grid-4">
+            <div class="card">
+                <div class="card-title">Estado Operativo</div>
+                <div class="card-value {text_status_class}" style="font-size: 1.3rem; margin-top: 10px;">{estado_str}</div>
+            </div>
+            <div class="card">
+                <div class="card-title">Saldo Líquido</div>
+                <div class="card-value">${saldo_usd}</div>
+            </div>
+            <div class="card">
+                <div class="card-title">Equidad Total</div>
+                <div class="card-value">${equidad_estimada}</div>
+            </div>
+            <div class="card">
+                <div class="card-title">Rendimiento (B/P)</div>
+                <div class="card-value">{win_rate}% <span style="font-size:1rem; color:var(--text-muted); font-weight:600;">({trades_ganadores}W / {trades_perdedores}L)</span></div>
+            </div>
+        </div>
+
+        {posicion_html}
+
+        <h2 class="section-title">📡 Escáner de Mercado</h2>
+        <div class="grid-3">
             {mercado_html}
         </div>
-    </div>
 
-    {posicion_html}
-
-    <div class="card">
-        <h2>📝 Historial de Eventos</h2>
-        <ul>
+        <h2 class="section-title">📝 Terminal de Eventos</h2>
+        <div class="logs-container">
             {historial_html}
-        </ul>
+        </div>
     </div>
 </body>
 </html>
@@ -345,7 +378,7 @@ HTML_TEMPLATE = """
 
 class WebDashboardHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
-        pass
+        pass # Suprimir logs de peticiones HTTP en la consola para no ensuciar
 
     def do_GET(self):
         self.send_response(200)
@@ -358,59 +391,84 @@ class WebDashboardHandler(BaseHTTPRequestHandler):
         win_rate = (estado['trades_ganadores'] / total_trades * 100) if total_trades > 0 else 0.0
 
         if estado['en_posicion']:
-            estado_str = f"🟢 EN POSICIÓN ({estado['par_activo']})"
-            estado_class = "positive"
+            estado_str = "EN POSICIÓN"
+            dot_class = "dot-active"
+            text_status_class = "text-success"
             precio_actual = estado['mercado_actual'].get(estado['par_activo'], {}).get('precio', estado['precio_compra'])
             
             valor_actual_posicion = estado['cantidad_activa'] * precio_actual
             equidad = estado['saldo_usd'] + valor_actual_posicion
             pnl = ((precio_actual - estado['precio_compra']) / estado['precio_compra']) * 100
-            pnl_class = "positive" if pnl >= 0 else "negative"
+            pnl_class = "text-success" if pnl >= 0 else "text-danger"
             
             pos_html = f"""
-            <div class="card" style="border-left-color: #4caf50;">
-                <h2>Trade Activo: {estado['par_activo']}</h2>
-                <div class="grid">
-                    <div><p>Precio Compra:</p><h3>{estado['precio_compra']:.2f} USD</h3></div>
-                    <div><p>Precio Actual:</p><h3>{precio_actual:.2f} USD</h3></div>
-                    <div><p>Rendimiento (P&L):</p><h3 class="{pnl_class}">{pnl:.2f}%</h3></div>
-                    <div><p>Stop Dinámico Mínimo:</p><h3 class="negative">{estado['stop_dinamico']:.2f} USD</h3></div>
+            <div class="card active-trade" style="margin-bottom: 20px;">
+                <div class="card-title" style="color: var(--success); font-size: 1rem;">🟢 OPERACIÓN ACTIVA: {estado['par_activo']}</div>
+                <div class="grid-4" style="margin-bottom: 0;">
+                    <div><span style="color: var(--text-muted); font-size: 0.85rem;">Precio de Compra</span><br><strong>${estado['precio_compra']:.2f}</strong></div>
+                    <div><span style="color: var(--text-muted); font-size: 0.85rem;">Precio Actual</span><br><strong>${precio_actual:.2f}</strong></div>
+                    <div><span style="color: var(--text-muted); font-size: 0.85rem;">P&L Abierto</span><br><strong class="{pnl_class}">{pnl:+.2f}%</strong></div>
+                    <div><span style="color: var(--text-muted); font-size: 0.85rem;">Stop Loss Dinámico</span><br><strong class="text-danger">${estado['stop_dinamico']:.2f}</strong></div>
                 </div>
             </div>
             """
         else:
-            estado_str = "🔴 LÍQUIDO (Buscando oportunidades)"
-            estado_class = "neutral"
+            estado_str = "LÍQUIDO / ESPERA"
+            dot_class = "dot-waiting"
+            text_status_class = "text-warning"
             equidad = estado['saldo_usd']
             pos_html = ""
 
-        # Construir bloques de mercado
+        # Construir bloques de mercado con inteligencia de colores
         mercado_bloques = ""
         for par, datos in estado['mercado_actual'].items():
-            if par == estado.get('par_activo'):
-                borde = "border: 1px solid #4caf50;"
-            else:
-                borde = ""
+            is_active = (par == estado.get('par_activo'))
+            active_style = "border-color: var(--success);" if is_active else ""
             
+            # Lógica de color RSI
+            rsi = datos['rsi']
+            if rsi > 65: rsi_color, rsi_text = "var(--danger)", "#fff"
+            elif rsi > 50: rsi_color, rsi_text = "var(--success)", "#fff"
+            else: rsi_color, rsi_text = "#2a2e39", "var(--text-main)"
+            
+            # Lógica de color Tendencia
+            tendencia = "ALCISTA" if datos['precio'] > datos['sma15'] else "BAJISTA"
+            tendencia_color = "var(--success)" if tendencia == "ALCISTA" else "var(--danger)"
+
             mercado_bloques += f"""
-            <div style="background-color: #2c2c2c; padding: 10px; border-radius: 4px; {borde}">
-                <strong>{par}</strong><br>
-                Precio: {datos['precio']:.2f}<br>
-                RSI: {datos['rsi']:.1f}<br>
-                SMA15: {datos['sma15']:.2f}
+            <div class="card market-card" style="{active_style}">
+                <div style="font-size: 1.2rem; font-weight: 800; margin-bottom: 5px; color: {'var(--success)' if is_active else 'var(--text-main)'};">
+                    {par} { '🎯' if is_active else ''}
+                </div>
+                
+                <div class="market-row">
+                    <span style="color: var(--text-muted);">Precio Actual:</span>
+                    <strong>${datos['precio']:.2f}</strong>
+                </div>
+                <div class="market-row">
+                    <span style="color: var(--text-muted);">Fuerza (RSI 14):</span>
+                    <span class="badge" style="background: {rsi_color}; color: {rsi_text};">{rsi:.1f}</span>
+                </div>
+                <div class="market-row">
+                    <span style="color: var(--text-muted);">Tendencia Corta:</span>
+                    <span class="badge" style="background: {tendencia_color}; color: #fff;">{tendencia}</span>
+                </div>
             </div>
             """
 
-        historial = "".join([f"<li>{linea}</li>" for linea in estado['historial']])
-        if not historial: historial = "<li>Sin eventos recientes.</li>"
+        historial = "".join([f"<div class='log-line'>{linea}</div>" for linea in estado['historial']])
+        if not historial: historial = "<div class='log-line'>Sin eventos recientes... Esperando iniciar ciclo.</div>"
 
         html_final = HTML_TEMPLATE.format(
             hora_actual=obtener_hora_local(),
+            dot_class=dot_class,
             estado_str=estado_str,
-            estado_class=estado_class,
-            saldo_usd=f"{estado['saldo_usd']:.2f}",
-            equidad_estimada=f"{equidad:.2f}",
+            text_status_class=text_status_class,
+            saldo_usd=f"{estado['saldo_usd']:,.2f}",
+            equidad_estimada=f"{equidad:,.2f}",
             win_rate=f"{win_rate:.1f}",
+            trades_ganadores=estado['trades_ganadores'],
+            trades_perdedores=estado['trades_perdedores'],
             mercado_html=mercado_bloques,
             posicion_html=pos_html,
             historial_html=historial
@@ -420,7 +478,7 @@ class WebDashboardHandler(BaseHTTPRequestHandler):
 def iniciar_servidor_web():
     port = int(os.environ.get("PORT", 8080))
     server = ThreadingHTTPServer(('0.0.0.0', port), WebDashboardHandler)
-    print(f"✓ Panel web iniciado en el puerto {port}", flush=True)
+    print(f"✓ Panel web PRO iniciado en el puerto {port}", flush=True)
     server.serve_forever()
 
 
