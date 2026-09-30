@@ -1,5 +1,4 @@
-Flask
 ccxt
 pandas
-numpy
 pymongo
+dnspython

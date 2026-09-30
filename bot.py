@@ -1,34 +1,76 @@
-import ccxt
-import pandas as pd
-import time
 import os
-import threading
+import time
 import json
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from pymongo import MongoClient
+import threading
+import pandas as pd
+import ccxt
 from datetime import datetime
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from pymongo import MongoClient
+from pymongo.errors import PyMongoError
 
 # --- CONFIGURACIÓN DE RIESGO Y ESTRATEGIA ---
 STOP_LOSS_PCT = 2.0
 TAKE_PROFIT_PCT = 4.0
-TRAILING_STOP_PCT = 1.5  # Distancia en % desde el máximo
+TRAILING_STOP_PCT = 1.5  # Distancia en % desde el máximo alcanzado
 FEE_PCT = 0.26           # Comisión estimada por operación en Kraken (0.26% Spot Taker)
 
 # --- PARÁMETROS DE FILTROS ---
 RSI_PERIODO = 14
 RSI_MIN = 50.0  # Mínimo impulso comprador
 RSI_MAX = 70.0  # Evita entrar sobrecomprado
+SMA_15M_PERIODO = 20
 SMA_1H_PERIODO = 20  # Periodo de la media en marco de 1 hora
 
-# --- CONEXIÓN A MONGODB ---
+# --- CONEXIÓN A MONGODB CON FALLBACK SEGURO ---
 MONGO_URI = os.environ.get("MONGO_URI")
-if MONGO_URI:
-    cliente_mongo = MongoClient(MONGO_URI)
-    db = cliente_mongo['trading_bot']
-    coleccion_estado = db['estado']
-else:
-    print("⚠️ ADVERTENCIA: No se encontró MONGO_URI en las variables de Render.", flush=True)
+coleccion_estado = None
 
+if MONGO_URI:
+    try:
+        cliente_mongo = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+        # Test de conexión
+        cliente_mongo.admin.command('ping')
+        db = cliente_mongo['trading_bot']
+        coleccion_estado = db['estado']
+        print("✓ Conexión exitosa a MongoDB Atlas.", flush=True)
+    except Exception as e:
+        print(f"⚠️ Error conectando a MongoDB: {e}. Se usará almacenamiento en memoria.", flush=True)
+        coleccion_estado = None
+else:
+    print("⚠️ MONGO_URI no configurado. Operando en modo memoria RAM.", flush=True)
+
+# Estado por defecto en memoria RAM (Fallback)
+estado_ram = {
+    "_id": "estado_actual",
+    "saldo_usd": 1000.0,
+    "btc_poseidos": 0.0,
+    "capital_invertido_usd": 0.0,
+    "precio_compra": 0.0,
+    "en_posicion": False,
+    "historial": [],
+    "balance_history": [1000.0],
+    "trades_ganadores": 0,
+    "trades_perdedores": 0,
+    "gross_profit": 0.0,
+    "gross_loss": 0.0,
+    "max_balance": 1000.0,
+    "precio_max_alcanzado": 0.0,
+    "stop_dinamico": 0.0,
+    "ultimo_precio": 0.0,
+    "ultima_sma_15m": 0.0,
+    "ultima_sma_1h": 0.0,
+    "ultimo_rsi": 0.0
+}
+
+# Instancia global única de CCXT
+exchange_kraken = ccxt.kraken({
+    'enableRateLimit': True,
+    'timeout': 15000
+})
+
+
+# --- FUNCIONES AUXILIARES ---
 def calcular_rsi(series, period=14):
     """Calcula el Relative Strength Index (RSI) usando suavizado exponencial de Wilder."""
     delta = series.diff()
@@ -36,49 +78,56 @@ def calcular_rsi(series, period=14):
     loss = -1 * delta.clip(upper=0)
     avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
-    rs = avg_gain / avg_loss
+    rs = avg_gain / (avg_loss + 1e-10)
     return 100 - (100 / (1 + rs))
 
+
 def obtener_estado():
-    """Lee el estado de la base de datos o lo inicializa."""
-    estado = coleccion_estado.find_one({"_id": "estado_actual"})
-    if not estado:
-        estado = {
-            "_id": "estado_actual",
-            "saldo_usd": 1000.0,
-            "btc_poseidos": 0.0,
-            "capital_invertido_usd": 0.0,
-            "precio_compra": 0.0,
-            "en_posicion": False,
-            "historial": [],
-            "balance_history": [1000.0], 
-            "trades_ganadores": 0,
-            "trades_perdedores": 0,
-            "gross_profit": 0.0,
-            "gross_loss": 0.0,
-            "max_balance": 1000.0,
-            "precio_max_alcanzado": 0.0,
-            "stop_dinamico": 0.0,
-            "ultimo_precio": 0.0,
-            "ultima_sma_15m": 0.0,
-            "ultima_sma_1h": 0.0,
-            "ultimo_rsi": 0.0
-        }
-        coleccion_estado.insert_one(estado)
-    
-    # Asegurar retrocompatibilidad con esquemas antiguos
-    if "precio_max_alcanzado" not in estado:
-        estado.update({"precio_max_alcanzado": estado.get("precio_compra", 0.0), "stop_dinamico": 0.0})
-    if "balance_history" not in estado:
-        estado.update({"balance_history": [1000.0], "trades_ganadores": 0, "trades_perdedores": 0, "gross_profit": 0.0, "gross_loss": 0.0, "max_balance": estado.get("saldo_usd", 1000.0)})
-    if "ultimo_precio" not in estado:
-        estado.update({"ultimo_precio": 0.0, "ultima_sma_15m": 0.0, "ultima_sma_1h": 0.0, "ultimo_rsi": 0.0})
-    if "capital_invertido_usd" not in estado:
-        estado.update({"capital_invertido_usd": 0.0})
-    return estado
+    """Lee el estado de la base de datos MongoDB o de la memoria RAM."""
+    global estado_ram
+    if coleccion_estado is not None:
+        try:
+            doc = coleccion_estado.find_one({"_id": "estado_actual"})
+            if not doc:
+                coleccion_estado.insert_one(estado_ram)
+                return estado_ram.copy()
+            
+            # Garantizar retrocompatibilidad con esquemas antiguos
+            mecanismos_seguros = {
+                "precio_max_alcanzado": doc.get("precio_compra", 0.0),
+                "stop_dinamico": 0.0,
+                "balance_history": [1000.0],
+                "trades_ganadores": 0,
+                "trades_perdedores": 0,
+                "gross_profit": 0.0,
+                "gross_loss": 0.0,
+                "max_balance": doc.get("saldo_usd", 1000.0),
+                "ultimo_precio": 0.0,
+                "ultima_sma_15m": 0.0,
+                "ultima_sma_1h": 0.0,
+                "ultimo_rsi": 0.0,
+                "capital_invertido_usd": 0.0
+            }
+            for clave, val in mecanismos_seguros.items():
+                if clave not in doc:
+                    doc[clave] = val
+            return doc
+        except PyMongoError as e:
+            print(f"⚠️ Error leyendo MongoDB: {e}. Usando RAM.", flush=True)
+
+    return estado_ram.copy()
+
 
 def guardar_estado(estado):
-    coleccion_estado.update_one({"_id": "estado_actual"}, {"$set": estado})
+    """Guarda el estado en MongoDB y en memoria RAM."""
+    global estado_ram
+    estado_ram = estado.copy()
+    if coleccion_estado is not None:
+        try:
+            coleccion_estado.update_one({"_id": "estado_actual"}, {"$set": estado}, upsert=True)
+        except PyMongoError as e:
+            print(f"⚠️ Error guardando en MongoDB: {e}", flush=True)
+
 
 def registrar_evento(estado, texto):
     fecha_hora = datetime.now().strftime('%d/%m/%Y %H:%M:%S')
@@ -88,36 +137,34 @@ def registrar_evento(estado, texto):
     estado['historial'] = historial[:15]
     print(linea, flush=True)
 
+
 # --- PANEL WEB INTERACTIVO ---
 class WebHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header('Content-type', 'text/html; charset=utf-8')
         self.end_headers()
-        
+
         estado = obtener_estado()
-        
-        # Métricas Cuantitativas
+
         total_trades = estado['trades_ganadores'] + estado['trades_perdedores']
         win_rate = (estado['trades_ganadores'] / total_trades * 100) if total_trades > 0 else 0
         profit_factor = (estado['gross_profit'] / estado['gross_loss']) if estado['gross_loss'] > 0 else (estado['gross_profit'] if estado['gross_profit'] > 0 else 0)
-        
+
         precio_actual = estado.get('ultimo_precio', estado['precio_compra'])
-        
-        # Saldo NETA estimado si vendiéramos en este instante (descontando comisión de salida)
+
         if estado['en_posicion']:
             saldo_bruto_est = estado['btc_poseidos'] * precio_actual
             saldo_actual = saldo_bruto_est * (1 - FEE_PCT / 100)
         else:
             saldo_actual = estado['saldo_usd']
 
-        drawdown = ((estado['max_balance'] - saldo_actual) / estado['max_balance'] * 100) if estado['max_balance'] > 0 else 0
+        max_bal = estado.get('max_balance', 1000.0)
+        drawdown = ((max_bal - saldo_actual) / max_bal * 100) if max_bal > 0 else 0
 
-        # Colores dinámicos
         capital_color = "#00ff66" if saldo_actual >= 1000.0 else "#ff4444"
         pf_color = "#00ff66" if profit_factor >= 1.0 else "#ffb86c"
 
-        # PnL Abierto Neto (Tenido en cuenta comisiones de entrada y salida)
         if estado['en_posicion'] and estado.get('capital_invertido_usd', 0) > 0:
             capital_inv = estado['capital_invertido_usd']
             pnl_pct = ((saldo_actual - capital_inv) / capital_inv) * 100
@@ -126,7 +173,6 @@ class WebHandler(BaseHTTPRequestHandler):
         else:
             pnl_str = ""
 
-        # Información del Stop Dinámico
         stop_val = estado.get('stop_dinamico', 0.0)
         if estado['en_posicion'] and stop_val > 0:
             stop_info_html = f"Stop Dinámico: ${stop_val:,.2f}"
@@ -137,19 +183,20 @@ class WebHandler(BaseHTTPRequestHandler):
             stop_info_html = "Sin Stop Activo"
 
         historial_items = "".join([f"<li>{item}</li>" for item in estado.get('historial', [])])
-        balance_json = json.dumps(estado['balance_history'])
+        balance_json = json.dumps(estado.get('balance_history', [1000.0]))
 
-        # Valores de Mercado en Vivo
         btc_price_str = f"${precio_actual:,.2f}" if precio_actual > 0 else "Cargando..."
         sma_15m_str = f"${estado.get('ultima_sma_15m', 0):,.2f}" if estado.get('ultima_sma_15m', 0) > 0 else "--"
         sma_1h_str = f"${estado.get('ultima_sma_1h', 0):,.2f}" if estado.get('ultima_sma_1h', 0) > 0 else "--"
         rsi_str = f"{estado.get('ultimo_rsi', 0):.1f}" if estado.get('ultimo_rsi', 0) > 0 else "--"
 
         html = f"""
+        <!DOCTYPE html>
         <html>
         <head>
             <title>Trading Bot Dashboard</title>
             <meta http-equiv="refresh" content="30">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
             <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
             <style>
                 body {{ font-family: monospace; padding: 20px; background-color: #0b0f19; color: #00ff66; max-width: 950px; margin: auto; }}
@@ -168,9 +215,7 @@ class WebHandler(BaseHTTPRequestHandler):
         <body>
             <h2>📊 Panel de Control Cuantitativo (BTC/USD - Kraken)</h2>
             
-            <!-- TARJETAS SUPERIORES (3 COLUMNAS) -->
             <div class="grid-3">
-                <!-- TARJETA 1: CAPITAL & ESTADO -->
                 <div class="box">
                     <div class="metric-title">Capital Actual (Neto)</div>
                     <div class="metric-value" style="color: {capital_color}">${saldo_actual:,.2f} USD</div>
@@ -179,7 +224,6 @@ class WebHandler(BaseHTTPRequestHandler):
                     </div>
                 </div>
 
-                <!-- TARJETA 2: DESEMPEÑO / MÉTRICAS -->
                 <div class="box">
                     <div class="metric-title">Win Rate / Profit Factor</div>
                     <div class="metric-value" style="color: #ffffff">
@@ -190,7 +234,6 @@ class WebHandler(BaseHTTPRequestHandler):
                     </div>
                 </div>
 
-                <!-- TARJETA 3: MERCADO EN VIVO -->
                 <div class="box">
                     <div class="metric-title">Mercado BTC (Fee: {FEE_PCT}%)</div>
                     <div class="metric-value" style="color: #ffffff">{btc_price_str}</div>
@@ -200,12 +243,10 @@ class WebHandler(BaseHTTPRequestHandler):
                 </div>
             </div>
 
-            <!-- GRÁFICO DE CAPITAL -->
             <div class="box" style="margin-bottom: 20px;">
                 <canvas id="equityChart"></canvas>
             </div>
 
-            <!-- HISTORIAL DE ACTIVIDAD -->
             <div class="box">
                 <div class="metric-title" style="margin-bottom:15px; color: #ffffff; font-size: 13px;">Última Actividad</div>
                 <ul>{historial_items if historial_items else '<li>Sin actividad registrada aún.</li>'}</ul>
@@ -250,77 +291,96 @@ class WebHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
+
 def run_server():
     port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(('0.0.0.0', port), WebHandler)
+    server = ThreadingHTTPServer(('0.0.0.0', port), WebHandler)
+    print(f"✓ Servidor Web escuchando en puerto {port}", flush=True)
     server.serve_forever()
+
 
 # --- LÓGICA DE TRADING ---
 def actualizar_estadisticas_venta(estado, saldo_obtenido, ganancia_usd):
     """Actualiza las métricas netas cuando se cierra una posición."""
-    estado['balance_history'].append(saldo_obtenido)
-    if saldo_obtenido > estado['max_balance']:
+    estado.setdefault('balance_history', [1000.0]).append(saldo_obtenido)
+    if saldo_obtenido > estado.get('max_balance', 1000.0):
         estado['max_balance'] = saldo_obtenido
-        
+
     if ganancia_usd > 0:
-        estado['trades_ganadores'] += 1
-        estado['gross_profit'] += ganancia_usd
+        estado['trades_ganadores'] = estado.get('trades_ganadores', 0) + 1
+        estado['gross_profit'] = estado.get('gross_profit', 0.0) + ganancia_usd
     else:
-        estado['trades_perdedores'] += 1
-        estado['gross_loss'] += abs(ganancia_usd)
+        estado['trades_perdedores'] = estado.get('trades_perdedores', 0) + 1
+        estado['gross_loss'] = estado.get('gross_loss', 0.0) + abs(ganancia_usd)
+
+
+def obtener_datos_mercado():
+    """Descarga OHLCV de Kraken con reintentos seguros."""
+    for intento in range(3):
+        try:
+            ohlcv_15m = exchange_kraken.fetch_ohlcv('BTC/USD', timeframe='15m', limit=50)
+            ohlcv_1h = exchange_kraken.fetch_ohlcv('BTC/USD', timeframe='1h', limit=50)
+            return ohlcv_15m, ohlcv_1h
+        except Exception as e:
+            print(f"⚠️ Reintento {intento + 1}/3 tras fallo en Kraken API: {e}", flush=True)
+            time.sleep(2)
+    raise RuntimeError("No se pudieron obtener datos de mercado desde Kraken.")
+
 
 def analizar_y_operar():
     estado = obtener_estado()
-    exchange = ccxt.kraken({'enableRateLimit': True})
-    
-    # 1. Marco de 15 minutos (Ejecución y Volumen)
-    ohlcv_15m = exchange.fetch_ohlcv('BTC/USD', timeframe='15m', limit=50)
+
+    try:
+        ohlcv_15m, ohlcv_1h = obtener_datos_mercado()
+    except Exception as e:
+        registrar_evento(estado, f"❌ Error recuperando datos de Kraken: {e}")
+        guardar_estado(estado)
+        return
+
+    # 1. Marco de 15 minutos
     df_15m = pd.DataFrame(ohlcv_15m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df_15m['sma_20'] = df_15m['close'].rolling(20).mean()
+    df_15m['sma_20'] = df_15m['close'].rolling(SMA_15M_PERIODO).mean()
     df_15m['vol_sma'] = df_15m['volume'].rolling(20).mean()
     df_15m['rsi'] = calcular_rsi(df_15m['close'], period=RSI_PERIODO)
-    
-    # Datos en vivo (para gestión de posiciones y stops)
-    precio_actual = df_15m['close'].iloc[-1]
-    media_15m_actual = df_15m['sma_20'].iloc[-1]
-    
-    # Datos de vela cerrada (iloc[-2]) para confirmación sólida de entrada
-    precio_cierre_15m = df_15m['close'].iloc[-2]
-    media_15m_cerrada = df_15m['sma_20'].iloc[-2]
-    rsi_cerrado = df_15m['rsi'].iloc[-2]
-    volumen_cerrado = df_15m['volume'].iloc[-2]
-    volumen_media_cerrada = df_15m['vol_sma'].iloc[-2]
-    
-    # 2. Marco de 1 hora (Filtro Multi-Timeframe Macro)
-    ohlcv_1h = exchange.fetch_ohlcv('BTC/USD', timeframe='1h', limit=50)
+
+    precio_actual = float(df_15m['close'].iloc[-1])
+    media_15m_actual = float(df_15m['sma_20'].iloc[-1])
+
+    # Datos de vela cerrada (iloc[-2]) para filtros estables
+    precio_cierre_15m = float(df_15m['close'].iloc[-2])
+    media_15m_cerrada = float(df_15m['sma_20'].iloc[-2])
+    rsi_cerrado = float(df_15m['rsi'].iloc[-2])
+    volumen_cerrado = float(df_15m['volume'].iloc[-2])
+    volumen_media_cerrada = float(df_15m['vol_sma'].iloc[-2])
+
+    # 2. Marco de 1 hora
     df_1h = pd.DataFrame(ohlcv_1h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df_1h['sma_1h'] = df_1h['close'].rolling(SMA_1H_PERIODO).mean()
-    media_1h = df_1h['sma_1h'].iloc[-1]
+    media_1h = float(df_1h['sma_1h'].iloc[-1])
 
-    # Guardar estado de mercado para el dashboard
-    estado['ultimo_precio'] = precio_actual 
+    # Guardar valores de mercado para la interfaz web
+    estado['ultimo_precio'] = precio_actual
     estado['ultima_sma_15m'] = media_15m_actual
     estado['ultima_sma_1h'] = media_1h
     estado['ultimo_rsi'] = rsi_cerrado
 
     if estado['en_posicion']:
-        # Saldo bruto y neto descontando la comisión de venta
         saldo_obtenido_bruto = estado['btc_poseidos'] * precio_actual
         saldo_obtenido_neto = saldo_obtenido_bruto * (1 - FEE_PCT / 100)
-        
+
         capital_invertido = estado.get('capital_invertido_usd', estado['btc_poseidos'] * estado['precio_compra'])
         ganancia_usd = saldo_obtenido_neto - capital_invertido
         porcentaje_variacion = ((precio_actual - estado['precio_compra']) / estado['precio_compra']) * 100
 
-        # Trailing Stop & Stop Loss dinámico evaluado en tiempo real
-        precio_max_alcanzado = estado.get('precio_max_alcanzado', estado['precio_compra'])
-        if precio_actual > precio_max_alcanzado:
-            precio_max_alcanzado = precio_actual
-            estado['precio_max_alcanzado'] = precio_max_alcanzado
+        # Trailing Stop & Stop Loss dinámico
+        precio_max_alcanzado = max(estado.get('precio_max_alcanzado', estado['precio_compra']), precio_actual)
+        estado['precio_max_alcanzado'] = precio_max_alcanzado
 
         precio_stop_inicial = estado['precio_compra'] * (1 - STOP_LOSS_PCT / 100)
         precio_trailing = precio_max_alcanzado * (1 - TRAILING_STOP_PCT / 100)
-        stop_dinamico = max(precio_stop_inicial, precio_trailing)
+        
+        # El stop dinámico solo puede aumentar (subir)
+        stop_dinamico = max(estado.get('stop_dinamico', 0.0), precio_stop_inicial, precio_trailing)
         estado['stop_dinamico'] = stop_dinamico
 
         # CONDICIONES DE SALIDA
@@ -342,9 +402,9 @@ def analizar_y_operar():
             estado['en_posicion'] = False
             estado['precio_max_alcanzado'] = 0.0
             estado['stop_dinamico'] = 0.0
-            
+
             if stop_dinamico == precio_trailing and precio_trailing > precio_stop_inicial:
-                registrar_evento(estado, f"🛡️️ TRAILING STOP | Venta: ${precio_actual:,.2f} | Net PnL: ${ganancia_usd:+,.2f}")
+                registrar_evento(estado, f"🛡 TRAILING STOP | Venta: ${precio_actual:,.2f} | Net PnL: ${ganancia_usd:+,.2f}")
             else:
                 registrar_evento(estado, f"🛑 STOP LOSS (-{STOP_LOSS_PCT}%) | Venta: ${precio_actual:,.2f} | Net PnL: ${ganancia_usd:+,.2f}")
 
@@ -357,13 +417,13 @@ def analizar_y_operar():
             estado['precio_max_alcanzado'] = 0.0
             estado['stop_dinamico'] = 0.0
             registrar_evento(estado, f"🔴 VENTA (Bajo SMA 15m) | Venta: ${precio_actual:,.2f} | Net PnL: ${ganancia_usd:+,.2f}")
-        
+
         else:
             pnl_neto_pct = ((saldo_obtenido_neto - capital_invertido) / capital_invertido) * 100
             registrar_evento(estado, f"📦 Posición Activa | BTC: ${precio_actual:,.2f} | Net PnL: {pnl_neto_pct:+.2f}%")
 
     else:
-        # CONDICIONES DE ENTRADA (4 FILTROS OBLIGATORIOS EVALUADOS EN VELA CERRADA)
+        # CONDICIONES DE ENTRADA
         cruce_alcista_confirmado = precio_cierre_15m > media_15m_cerrada
         tendencia_1h_alcista = precio_actual > media_1h
         rsi_optimo = RSI_MIN <= rsi_cerrado <= RSI_MAX
@@ -372,8 +432,8 @@ def analizar_y_operar():
         if cruce_alcista_confirmado and tendencia_1h_alcista and rsi_optimo and volumen_optimo:
             capital_entrada = estado['saldo_usd']
             btc_comprados_brutos = capital_entrada / precio_actual
-            btc_comprados_netos = btc_comprados_brutos * (1 - FEE_PCT / 100)  # Deducción comisión compra
-            
+            btc_comprados_netos = btc_comprados_brutos * (1 - FEE_PCT / 100)
+
             estado['btc_poseidos'] = btc_comprados_netos
             estado['capital_invertido_usd'] = capital_entrada
             estado['precio_compra'] = precio_actual
@@ -388,25 +448,29 @@ def analizar_y_operar():
             if not tendencia_1h_alcista: bloqueos.append("1h Bajista")
             if not rsi_optimo: bloqueos.append(f"RSI: {rsi_cerrado:.1f}")
             if not volumen_optimo: bloqueos.append("Vol bajo")
-            
+
             info_filtro = " | ".join(bloqueos)
             registrar_evento(estado, f"💤 En Espera | BTC: ${precio_actual:,.2f} | [{info_filtro}]")
 
     guardar_estado(estado)
 
+
 def bucle_trading():
-    time.sleep(5)
+    time.sleep(3)
     while True:
         try:
             analizar_y_operar()
         except Exception as e:
-            print(f"❌ Error en bucle: {e}", flush=True)
+            print(f"❌ Error crítico en bucle de trading: {e}", flush=True)
         time.sleep(300)
 
+
 if __name__ == '__main__':
-    if MONGO_URI:
-        print(f"=== BOT V8 INICIADO (Kraken + Comisiones {FEE_PCT}% + Cierre Vela + Vol + Dashboard) ===", flush=True)
-        hilo_bot = threading.Thread(target=bucle_trading)
-        hilo_bot.daemon = True
-        hilo_bot.start()
-        run_server()
+    print(f"=== BOT V8 INICIADO (Kraken + Comisiones {FEE_PCT}% + Cierre Vela + Vol + Dashboard) ===", flush=True)
+    
+    # Hilo secundario para la estrategia
+    hilo_bot = threading.Thread(target=bucle_trading, daemon=True)
+    hilo_bot.start()
+
+    # Hilo principal para el servidor web (Health check de Render + Dashboard)
+    run_server()
