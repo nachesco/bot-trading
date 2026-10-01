@@ -3,7 +3,7 @@ import sys
 import time
 import json
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import requests
 from pymongo import MongoClient, errors
@@ -15,7 +15,6 @@ MONGO_URI = os.environ.get("MONGO_URI", "mongodb+srv://admin:password@cluster.mo
 DB_NAME = "trading_bot_db"
 COLLECTION_NAME = "bot_state"
 
-# Timeouts en MongoDB para evitar que la aplicación se congele por microcortes
 try:
     mongo_client = MongoClient(
         MONGO_URI,
@@ -47,7 +46,8 @@ ESTADO_DEFAULT = {
     "trades_perdedores": 0,
     "balance_history": [1000.0],
     "historial": [],
-    "mercado_actual": {}
+    "mercado_actual": {},
+    "ultimo_timestamp_analizado": 0
 }
 
 def obtener_hora_local():
@@ -57,13 +57,12 @@ def obtener_estado():
     try:
         doc = state_col.find_one({"_id": "main_state"})
         if doc:
-            # Asegurar que las nuevas variables existan en estados antiguos
             data = doc["data"]
-            if "take_profit" not in data: data["take_profit"] = 0.0
-            if "inversion_bruta" not in data: data["inversion_bruta"] = 0.0
+            for key, val in ESTADO_DEFAULT.items():
+                if key not in data: data[key] = val
             return data
     except Exception as e:
-        print(f"Error al obtener estado de MongoDB: {e}")
+        print(f"Error al obtener estado: {e}")
     return ESTADO_DEFAULT.copy()
 
 def guardar_estado(estado):
@@ -74,72 +73,90 @@ def guardar_estado(estado):
             upsert=True
         )
     except Exception as e:
-        print(f"Error al guardar estado en MongoDB: {e}")
+        print(f"Error al guardar estado: {e}")
 
 def registrar_evento_en_estado(estado, mensaje):
     timestamp = obtener_hora_local()
     linea = f"[{timestamp}] {mensaje}"
     if "historial" not in estado or not isinstance(estado["historial"], list):
         estado["historial"] = []
-    
-    # Insertar al inicio para mostrar los eventos más recientes primero
     estado["historial"].insert(0, linea)
-    # Limitar el historial cargado en DB a un máximo de 100 eventos
     estado["historial"] = estado["historial"][:100]
 
 # ==========================================
-# INDICADORES TÉCNICOS (CALCULADORA MOTOR)
+# INDICADORES TÉCNICOS (MATEMÁTICA REAL)
 # ==========================================
+def rma(series, period):
+    """Media Móvil Suavizada (Running Moving Average) usada por Wilder"""
+    if len(series) < period:
+        return []
+    rmas = [sum(series[:period]) / period]
+    for val in series[period:]:
+        rmas.append((rmas[-1] * (period - 1) + val) / period)
+    return rmas
+
+def calcular_adx(velas, periodo=14):
+    """Cálculo real del ADX de J. Welles Wilder (+DI, -DI, DX)"""
+    if len(velas) < periodo * 2:
+        return 20.0
+    
+    trs, pDMs, nDMs = [], [], []
+    for i in range(1, len(velas)):
+        high, low = velas[i]['high'], velas[i]['low']
+        prev_high, prev_low, prev_close = velas[i-1]['high'], velas[i-1]['low'], velas[i-1]['close']
+        
+        # True Range
+        trs.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
+        
+        # Movimientos Direccionales
+        up_move = high - prev_high
+        down_move = prev_low - low
+        
+        pDMs.append(up_move if up_move > down_move and up_move > 0 else 0)
+        nDMs.append(down_move if down_move > up_move and down_move > 0 else 0)
+        
+    smooth_tr = rma(trs, periodo)
+    smooth_pdm = rma(pDMs, periodo)
+    smooth_ndm = rma(nDMs, periodo)
+    
+    if not smooth_tr: return 20.0
+    
+    dxs = []
+    for i in range(len(smooth_tr)):
+        tr = smooth_tr[i]
+        if tr == 0: 
+            dxs.append(0)
+            continue
+        pdi = 100 * (smooth_pdm[i] / tr)
+        ndi = 100 * (smooth_ndm[i] / tr)
+        sum_di = pdi + ndi
+        dxs.append(100 * abs(pdi - ndi) / sum_di if sum_di != 0 else 0)
+        
+    adx_rma = rma(dxs, periodo)
+    return round(adx_rma[-1], 2) if adx_rma else 20.0
+
 def calcular_rsi(precios, periodo=14):
-    if len(precios) < periodo + 1:
-        return 50.0
+    if len(precios) < periodo + 1: return 50.0
     ganancias, perdidas = 0.0, 0.0
     for i in range(1, periodo + 1):
         diff = precios[-i] - precios[-(i + 1)]
-        if diff >= 0:
-            ganancias += diff
-        else:
-            perdidas -= diff
-    avg_gain = ganancias / periodo
-    avg_loss = perdidas / periodo
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return 100.0 - (100.0 / (1.0 + rs))
+        if diff >= 0: ganancias += diff
+        else: perdidas -= diff
+    avg_gain, avg_loss = ganancias / periodo, perdidas / periodo
+    if avg_loss == 0: return 100.0
+    return 100.0 - (100.0 / (1.0 + (avg_gain / avg_loss)))
 
 def calcular_atr(velas, periodo=14):
-    if len(velas) < periodo + 1:
-        return 10.0
-    trs = []
-    for i in range(1, len(velas)):
-        high = velas[i]['high']
-        low = velas[i]['low']
-        prev_close = velas[i-1]['close']
-        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
-        trs.append(tr)
+    if len(velas) < periodo + 1: return 10.0
+    trs = [max(v['high'] - v['low'], abs(v['high'] - velas[i-1]['close']), abs(v['low'] - velas[i-1]['close'])) 
+           for i, v in enumerate(velas) if i > 0]
     return sum(trs[-periodo:]) / periodo if trs else 10.0
 
-def calcular_adx(velas, periodo=14):
-    if len(velas) < periodo + 1:
-        return 20.0
-    subidas = 0
-    totales = 0
-    for i in range(1, len(velas)):
-        diff = abs(velas[i]['close'] - velas[i-1]['close'])
-        totales += diff
-        if velas[i]['close'] > velas[i-1]['close']:
-            subidas += diff
-    fuerza = (subidas / totales * 100) if totales > 0 else 50
-    return round(min(max(fuerza, 15.0), 45.0), 1)
-
 def calcular_vwap(velas):
-    if not velas:
-        return 0.0
+    if not velas: return 0.0
     vol_total = sum(v['volume'] for v in velas)
-    if vol_total == 0:
-        return velas[-1]['close']
-    pv_total = sum(((v['high'] + v['low'] + v['close']) / 3.0) * v['volume'] for v in velas)
-    return pv_total / vol_total
+    if vol_total == 0: return velas[-1]['close']
+    return sum(((v['high'] + v['low'] + v['close']) / 3.0) * v['volume'] for v in velas) / vol_total
 
 # ==========================================
 # PLANTILLA HTML DEL DASHBOARD
@@ -151,21 +168,11 @@ HTML_TEMPLATE = """
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Quant Bot | Pro Analytics</title>
-    <meta http-equiv="refresh" content="15">
+    <meta http-equiv="refresh" content="30">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
-        :root {{
-            --bg-dark: #0b0e14;
-            --bg-card: #151a23;
-            --text-main: #f0f4f8;
-            --text-muted: #8b9bb4;
-            --accent: #3b82f6;
-            --success: #10b981;
-            --danger: #ef4444;
-            --warning: #f59e0b;
-            --border: #2a2e39;
-        }}
+        :root {{ --bg-dark: #0b0e14; --bg-card: #151a23; --text-main: #f0f4f8; --text-muted: #8b9bb4; --accent: #3b82f6; --success: #10b981; --danger: #ef4444; --warning: #f59e0b; --border: #2a2e39; }}
         body {{ font-family: 'Inter', sans-serif; background: var(--bg-dark); color: var(--text-main); margin: 0; padding: 20px; }}
         .container {{ max-width: 1200px; margin: 0 auto; }}
         .header {{ display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); padding-bottom: 20px; margin-bottom: 20px; flex-wrap: wrap; gap: 15px;}}
@@ -177,141 +184,52 @@ HTML_TEMPLATE = """
         .grid-4 {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 15px; margin-bottom: 20px; }}
         .grid-3 {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 15px; margin-bottom: 20px; }}
         .card {{ background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; padding: 20px; transition: transform 0.2s; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
-        .card:hover {{ border-color: var(--text-muted); }}
         .card-title {{ font-size: 0.85rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 10px; font-weight: 600; }}
         .card-value {{ font-size: 1.8rem; font-weight: 800; margin: 0; }}
-        .text-success {{ color: var(--success); }}
-        .text-danger {{ color: var(--danger); }}
-        .text-warning {{ color: var(--warning); }}
+        .text-success {{ color: var(--success); }} .text-danger {{ color: var(--danger); }} .text-warning {{ color: var(--warning); }}
         .active-trade {{ background: linear-gradient(145deg, rgba(16,185,129,0.08) 0%, rgba(21,26,35,1) 100%); border: 1px solid var(--success); }}
         .market-card {{ display: flex; flex-direction: column; gap: 10px; }}
         .market-row {{ display: flex; justify-content: space-between; align-items: center; border-bottom: 1px dashed var(--border); padding-bottom: 8px; font-size: 0.9rem; }}
         .market-row:last-child {{ border-bottom: none; padding-bottom: 0; }}
         .badge {{ padding: 4px 10px; border-radius: 6px; font-size: 0.75rem; font-weight: 800; letter-spacing: 0.5px; text-transform: uppercase; }}
         .section-header {{ display: flex; justify-content: space-between; align-items: center; margin: 35px 0 15px 0; border-bottom: 1px solid var(--border); padding-bottom: 10px; }}
-        .section-title {{ font-size: 1.2rem; margin: 0; display: flex; align-items: center; gap: 8px; }}
         .btn-clean {{ background: var(--bg-card); color: var(--text-muted); border: 1px solid var(--border); padding: 6px 14px; border-radius: 8px; text-decoration: none; font-size: 0.8rem; font-weight: 600; transition: all 0.2s ease; }}
         .btn-clean:hover {{ color: var(--danger); border-color: var(--danger); }}
         .logs-container {{ background: #000; border: 1px solid var(--border); border-radius: 12px; padding: 15px; height: 300px; overflow-y: auto; font-family: 'Consolas', 'Courier New', monospace; font-size: 0.85rem; color: #a9b1d6; box-shadow: inset 0 2px 10px rgba(0,0,0,0.5); }}
         .log-line {{ margin-bottom: 8px; padding-bottom: 8px; border-bottom: 1px solid #1a1b26; line-height: 1.4; }}
-        .log-line:last-child {{ border: none; }}
         .chart-container {{ position: relative; height: 260px; width: 100%; margin-top: 10px; }}
-        ::-webkit-scrollbar {{ width: 8px; }}
-        ::-webkit-scrollbar-track {{ background: var(--bg-dark); }}
-        ::-webkit-scrollbar-thumb {{ background: var(--border); border-radius: 4px; }}
-        ::-webkit-scrollbar-thumb:hover {{ background: var(--text-muted); }}
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <h1>
-                <span class="status-dot {dot_class}"></span>
-                Panel Cuantitativo Avanzado
-            </h1>
-            <div style="text-align: right; color: var(--text-muted); font-size: 0.85rem; font-family: monospace;">
-                Última actualización: {hora_actual}
-            </div>
+            <h1><span class="status-dot {dot_class}"></span> Panel Cuantitativo Avanzado</h1>
+            <div style="text-align: right; color: var(--text-muted); font-size: 0.85rem; font-family: monospace;">Última actualización: {hora_actual}</div>
         </div>
-
         <div class="grid-4">
-            <div class="card">
-                <div class="card-title">Estado Operativo</div>
-                <div class="card-value {text_status_class}" style="font-size: 1.3rem; margin-top: 10px;">{estado_str}</div>
-            </div>
-            <div class="card">
-                <div class="card-title">Saldo Líquido</div>
-                <div class="card-value">${saldo_usd}</div>
-            </div>
-            <div class="card">
-                <div class="card-title">Equidad Total</div>
-                <div class="card-value">${equidad_estimada}</div>
-            </div>
-            <div class="card">
-                <div class="card-title">Rendimiento (B/P)</div>
-                <div class="card-value">{win_rate}% <span style="font-size:1rem; color:var(--text-muted); font-weight:600;">({trades_ganadores}W / {trades_perdedores}L)</span></div>
-            </div>
+            <div class="card"><div class="card-title">Estado Operativo</div><div class="card-value {text_status_class}" style="font-size: 1.3rem; margin-top: 10px;">{estado_str}</div></div>
+            <div class="card"><div class="card-title">Saldo Líquido</div><div class="card-value">${saldo_usd}</div></div>
+            <div class="card"><div class="card-title">Equidad Total</div><div class="card-value">${equidad_estimada}</div></div>
+            <div class="card"><div class="card-title">Rendimiento (B/P)</div><div class="card-value">{win_rate}% <span style="font-size:1rem; color:var(--text-muted); font-weight:600;">({trades_ganadores}W / {trades_perdedores}L)</span></div></div>
         </div>
-
         {posicion_html}
-
         <div class="card" style="margin-bottom: 20px;">
             <div class="card-title">📈 Curva de Equidad (Evolución de Capital)</div>
-            <div class="chart-container">
-                <canvas id="equityChart"></canvas>
-            </div>
+            <div class="chart-container"><canvas id="equityChart"></canvas></div>
         </div>
-
-        <div class="section-header">
-            <h2 class="section-title">📡 Matriz de Análisis (1H)</h2>
-        </div>
-        <div class="grid-3">
-            {mercado_html}
-        </div>
-
-        <div class="section-header">
-            <h2 class="section-title">📝 Terminal de Eventos</h2>
-            <a href="/limpiar" class="btn-clean">🗑️ Limpiar Terminal</a>
-        </div>
-        <div class="logs-container">
-            {historial_html}
-        </div>
+        <div class="section-header"><h2 class="section-title" style="margin:0; font-size: 1.2rem;">📡 Matriz de Análisis (1H)</h2></div>
+        <div class="grid-3">{mercado_html}</div>
+        <div class="section-header"><h2 class="section-title" style="margin:0; font-size: 1.2rem;">📝 Terminal de Eventos</h2><a href="/limpiar" class="btn-clean">🗑️ Limpiar Terminal</a></div>
+        <div class="logs-container">{historial_html}</div>
     </div>
-
     <script>
-        const balanceData = {balance_data_json};
-        const balanceLabels = {balance_labels_json};
-
         const ctx = document.getElementById('equityChart').getContext('2d');
         const gradient = ctx.createLinearGradient(0, 0, 0, 260);
-        gradient.addColorStop(0, 'rgba(59, 130, 246, 0.35)');
-        gradient.addColorStop(1, 'rgba(59, 130, 246, 0.0)');
-
+        gradient.addColorStop(0, 'rgba(59, 130, 246, 0.35)'); gradient.addColorStop(1, 'rgba(59, 130, 246, 0.0)');
         new Chart(ctx, {{
             type: 'line',
-            data: {{
-                labels: balanceLabels,
-                datasets: [{{
-                    label: 'Saldo Total ($)',
-                    data: balanceData,
-                    borderColor: '#3b82f6',
-                    borderWidth: 2.5,
-                    backgroundColor: gradient,
-                    fill: true,
-                    tension: 0.3,
-                    pointRadius: 4,
-                    pointHoverRadius: 6,
-                    pointBackgroundColor: '#10b981'
-                }}]
-            }},
-            options: {{
-                responsive: true,
-                maintainAspectRatio: false,
-                plugins: {{
-                    legend: {{ display: false }},
-                    tooltip: {{
-                        callbacks: {{
-                            label: function(context) {{
-                                return 'Saldo: $' + context.parsed.y.toFixed(2);
-                            }}
-                        }}
-                    }}
-                }},
-                scales: {{
-                    x: {{
-                        grid: {{ color: '#1a1b26', drawBorder: false }},
-                        ticks: {{ color: '#8b9bb4', font: {{ family: 'Inter' }} }}
-                    }},
-                    y: {{
-                        grid: {{ color: '#2a2e39', drawBorder: false }},
-                        ticks: {{ 
-                            color: '#8b9bb4', 
-                            font: {{ family: 'Inter' }},
-                            callback: function(value) {{ return '$' + value; }}
-                        }}
-                    }}
-                }}
-            }}
+            data: {{ labels: {balance_labels_json}, datasets: [{{ label: 'Saldo Total ($)', data: {balance_data_json}, borderColor: '#3b82f6', borderWidth: 2.5, backgroundColor: gradient, fill: true, tension: 0.3, pointRadius: 4, pointBackgroundColor: '#10b981' }}] }},
+            options: {{ responsive: true, maintainAspectRatio: false, plugins: {{ legend: {{ display: false }} }}, scales: {{ x: {{ grid: {{ color: '#1a1b26' }}, ticks: {{ color: '#8b9bb4' }} }}, y: {{ grid: {{ color: '#2a2e39' }}, ticks: {{ color: '#8b9bb4', callback: v => '$'+v }} }} }} }}
         }});
     </script>
 </body>
@@ -322,20 +240,17 @@ HTML_TEMPLATE = """
 # SERVIDOR WEB Y CONTROLADOR HTTP
 # ==========================================
 class WebDashboardHandler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        pass
-
+    def log_message(self, format, *args): pass
     def do_GET(self):
         if self.path == '/limpiar':
             estado = obtener_estado()
             estado['historial'] = []
-            registrar_evento_en_estado(estado, "🧹 Terminal de eventos limpiada correctamente.")
             guardar_estado(estado)
             self.send_response(302)
             self.send_header('Location', '/')
             self.end_headers()
             return
-
+            
         self.send_response(200)
         self.send_header('Content-type', 'text/html; charset=utf-8')
         self.end_headers()
@@ -343,117 +258,58 @@ class WebDashboardHandler(BaseHTTPRequestHandler):
         estado = obtener_estado()
         total_trades = estado.get('trades_ganadores', 0) + estado.get('trades_perdedores', 0)
         win_rate = (estado.get('trades_ganadores', 0) / total_trades * 100) if total_trades > 0 else 0.0
-
         history = estado.get('balance_history', [1000.0])
-        balance_data_json = json.dumps(history)
-        balance_labels_json = json.dumps([f"Trade {i}" if i > 0 else "Inicio" for i in range(len(history))])
 
         if estado.get('en_posicion'):
-            estado_str = "EN POSICIÓN"
-            dot_class = "dot-active"
-            text_status_class = "text-success"
+            estado_str, dot_class, text_status_class = "EN POSICIÓN", "dot-active", "text-success"
             par = estado.get('par_activo', 'BTC/USD')
-            precio_compra = estado.get('precio_compra', 0.0)
-            precio_actual = estado.get('mercado_actual', {}).get(par, {}).get('precio', precio_compra)
-
-            valor_actual_posicion = estado.get('cantidad_activa', 0.0) * precio_actual
-            equidad = estado.get('saldo_usd', 0.0) + valor_actual_posicion
+            precio_actual = estado.get('mercado_actual', {}).get(par, {}).get('precio', estado['precio_compra'])
+            valor_actual = estado['cantidad_activa'] * precio_actual
+            equidad = estado['saldo_usd'] + valor_actual
+            inversion_inicial = estado.get("inversion_bruta", estado['precio_compra'] * estado['cantidad_activa'])
+            pnl = ((valor_actual - inversion_inicial) / inversion_inicial * 100) if inversion_inicial > 0 else 0.0
             
-            # P&L basado en la inversión bruta descontando comisiones de entrada
-            inversion_inicial = estado.get("inversion_bruta", precio_compra * estado.get('cantidad_activa', 0.0))
-            if inversion_inicial > 0:
-                pnl_abierto = valor_actual_posicion - inversion_inicial
-                pnl = (pnl_abierto / inversion_inicial) * 100
-            else:
-                pnl = 0.0
-                
-            pnl_class = "text-success" if pnl >= 0 else "text-danger"
-
             pos_html = f"""
             <div class="card active-trade" style="margin-bottom: 20px;">
                 <div class="card-title" style="color: var(--success); font-size: 1rem;">🟢 OPERACIÓN ACTIVA: {par}</div>
                 <div class="grid-5" style="margin-bottom: 0;">
-                    <div><span style="color: var(--text-muted); font-size: 0.85rem;">Precio Entrada</span><br><strong>${precio_compra:,.2f}</strong></div>
+                    <div><span style="color: var(--text-muted); font-size: 0.85rem;">Precio Entrada</span><br><strong>${estado['precio_compra']:,.2f}</strong></div>
                     <div><span style="color: var(--text-muted); font-size: 0.85rem;">Precio Actual</span><br><strong>${precio_actual:,.2f}</strong></div>
-                    <div><span style="color: var(--text-muted); font-size: 0.85rem;">P&L Neto Abierto</span><br><strong class="{pnl_class}">{pnl:+.2f}%</strong></div>
-                    <div><span style="color: var(--text-muted); font-size: 0.85rem;">Stop ATR</span><br><strong class="text-danger">${estado.get('stop_dinamico', 0.0):,.2f}</strong></div>
-                    <div><span style="color: var(--text-muted); font-size: 0.85rem;">Take Profit</span><br><strong class="text-success">${estado.get('take_profit', 0.0):,.2f}</strong></div>
+                    <div><span style="color: var(--text-muted); font-size: 0.85rem;">P&L Neto Abierto</span><br><strong class="{'text-success' if pnl>=0 else 'text-danger'}">{pnl:+.2f}%</strong></div>
+                    <div><span style="color: var(--text-muted); font-size: 0.85rem;">Stop Loss</span><br><strong class="text-danger">${estado['stop_dinamico']:,.2f}</strong></div>
+                    <div><span style="color: var(--text-muted); font-size: 0.85rem;">Take Profit</span><br><strong class="text-success">${estado['take_profit']:,.2f}</strong></div>
                 </div>
-            </div>
-            """
+            </div>"""
         else:
-            estado_str = "ESCANEO ACTIVO"
-            dot_class = "dot-waiting"
-            text_status_class = "text-warning"
-            equidad = estado.get('saldo_usd', 1000.0)
-            pos_html = ""
+            estado_str, dot_class, text_status_class = "ESCANEO ACTIVO", "dot-waiting", "text-warning"
+            equidad, pos_html = estado['saldo_usd'], ""
 
         mercado_bloques = ""
         for par, datos in estado.get('mercado_actual', {}).items():
             is_active = (par == estado.get('par_activo'))
-            active_style = "border-color: var(--success);" if is_active else ""
-
-            rsi = datos.get('rsi', 50)
-            if rsi > 70: rsi_color, rsi_text = "var(--danger)", "#fff"
-            elif rsi > 50: rsi_color, rsi_text = "var(--success)", "#fff"
-            else: rsi_color, rsi_text = "#2a2e39", "var(--text-main)"
-
-            adx = datos.get('adx', 20)
-            if adx > 25: adx_color, adx_label = "var(--success)", "Fuerte"
-            else: adx_color, adx_label = "#2a2e39", "Débil/Lateral"
-
-            vwap = datos.get('vwap', 0)
-            precio = datos.get('precio', 0)
-            if precio > vwap: vwap_color, vwap_label = "var(--success)", "Soporte (Alcista)"
-            else: vwap_color, vwap_label = "var(--danger)", "Resistencia (Bajista)"
-
+            adx_color = "var(--success)" if datos.get('adx', 0) > 25 else "#2a2e39"
+            vwap_color = "var(--success)" if datos.get('precio', 0) > datos.get('vwap', 0) else "var(--danger)"
+            
             mercado_bloques += f"""
-            <div class="card market-card" style="{active_style}">
-                <div style="font-size: 1.2rem; font-weight: 800; margin-bottom: 5px; color: {'var(--success)' if is_active else 'var(--text-main)'}; display:flex; justify-content:space-between;">
-                    <span>{par}</span>
-                    <span style="font-size:0.9rem; color:var(--text-muted); font-weight:400;">Vol. ATR: ${datos.get('atr', 0):.2f}</span>
+            <div class="card market-card" style="{'border-color: var(--success);' if is_active else ''}">
+                <div style="font-size: 1.2rem; font-weight: 800; color: {'var(--success)' if is_active else 'var(--text-main)'}; display:flex; justify-content:space-between;">
+                    <span>{par}</span><span style="font-size:0.9rem; color:var(--text-muted); font-weight:400;">ATR: ${datos.get('atr', 0):.2f}</span>
                 </div>
-                
-                <div class="market-row">
-                    <span style="color: var(--text-muted);">Cotización:</span>
-                    <strong>${precio:,.2f}</strong>
-                </div>
-                <div class="market-row">
-                    <span style="color: var(--text-muted);">Fuerza Tendencial (ADX):</span>
-                    <span class="badge" style="background: {adx_color}; color: #fff;">{adx:.1f} - {adx_label}</span>
-                </div>
-                <div class="market-row">
-                    <span style="color: var(--text-muted);">Momentum (RSI):</span>
-                    <span class="badge" style="background: {rsi_color}; color: {rsi_text};">{rsi:.1f}</span>
-                </div>
-                <div class="market-row">
-                    <span style="color: var(--text-muted);">Estructura Volumen (VWAP):</span>
-                    <span class="badge" style="background: {vwap_color}; color: #fff;">{vwap_label}</span>
-                </div>
-            </div>
-            """
+                <div class="market-row"><span style="color: var(--text-muted);">Cotización:</span><strong>${datos.get('precio', 0):,.2f}</strong></div>
+                <div class="market-row"><span style="color: var(--text-muted);">ADX (Wilder):</span><span class="badge" style="background: {adx_color}; color: #fff;">{datos.get('adx', 0):.1f}</span></div>
+                <div class="market-row"><span style="color: var(--text-muted);">RSI:</span><strong>{datos.get('rsi', 0):.1f}</strong></div>
+                <div class="market-row"><span style="color: var(--text-muted);">Tendencia (VWAP):</span><span class="badge" style="background: {vwap_color}; color: #fff;">{'Alcista' if datos.get('precio',0) > datos.get('vwap',0) else 'Bajista'}</span></div>
+            </div>"""
 
-        historial_list = estado.get('historial', [])
-        historial = "".join([f"<div class='log-line'>{linea}</div>" for linea in historial_list])
-        if not historial: historial = "<div class='log-line'>Sistema inicializado. Analizando mercados...</div>"
+        historial = "".join([f"<div class='log-line'>{l}</div>" for l in estado.get('historial', [])]) or "<div class='log-line'>Analizando mercados...</div>"
 
-        html_final = HTML_TEMPLATE.format(
-            hora_actual=obtener_hora_local(),
-            dot_class=dot_class,
-            estado_str=estado_str,
-            text_status_class=text_status_class,
-            saldo_usd=f"{estado.get('saldo_usd', 1000.0):,.2f}",
-            equidad_estimada=f"{equidad:,.2f}",
-            win_rate=f"{win_rate:.1f}",
-            trades_ganadores=estado.get('trades_ganadores', 0),
-            trades_perdedores=estado.get('trades_perdedores', 0),
-            mercado_html=mercado_bloques,
-            posicion_html=pos_html,
-            historial_html=historial,
-            balance_data_json=balance_data_json,
-            balance_labels_json=balance_labels_json
-        )
-        self.wfile.write(html_final.encode('utf-8'))
+        self.wfile.write(HTML_TEMPLATE.format(
+            hora_actual=obtener_hora_local(), dot_class=dot_class, estado_str=estado_str, text_status_class=text_status_class,
+            saldo_usd=f"{estado['saldo_usd']:,.2f}", equidad_estimada=f"{equidad:,.2f}", win_rate=f"{win_rate:.1f}",
+            trades_ganadores=estado['trades_ganadores'], trades_perdedores=estado['trades_perdedores'],
+            posicion_html=pos_html, mercado_html=mercado_bloques, historial_html=historial,
+            balance_data_json=json.dumps(history), balance_labels_json=json.dumps([f"T{i}" if i>0 else "Inicio" for i in range(len(history))])
+        ).encode('utf-8'))
 
 # ==========================================
 # MOTOR CUANTITATIVO Y BUCLE DE TRADING
@@ -462,153 +318,135 @@ def obtener_datos_kraken(pair_symbol):
     m_map = {"BTC/USD": "XXBTZUSD", "ETH/USD": "XETHZUSD", "SOL/USD": "SOLUSD"}
     symbol = m_map.get(pair_symbol, "XXBTZUSD")
     try:
-        # MEJORA: Cambio a temporalidad de 1H (interval=60) para mitigar el impacto de las comisiones en tendencias cortas
         url = f"https://api.kraken.com/0/public/OHLC?pair={symbol}&interval=60"
         res = requests.get(url, timeout=5).json()
-        if res.get("error"):
-            return None
-        key = list(res["result"].keys())[0]
-        raw_candles = res["result"][key]
-        velas = []
-        for c in raw_candles[-30:]:
-            velas.append({
-                'time': c[0],
-                'open': float(c[1]),
-                'high': float(c[2]),
-                'low': float(c[3]),
-                'close': float(c[4]),
-                'vwap': float(c[5]),
-                'volume': float(c[6])
-            })
-        return velas
-    except Exception as e:
-        return None
+        if res.get("error"): return None
+        raw_candles = res["result"][list(res["result"].keys())[0]]
+        return [{ 'time': c[0], 'open': float(c[1]), 'high': float(c[2]), 'low': float(c[3]), 'close': float(c[4]), 'vwap': float(c[5]), 'volume': float(c[6]) } for c in raw_candles[-60:]]
+    except Exception: return None
 
 def ejecutar_bucle_quant():
-    print("=== INICIANDO QUANT ENGINE V2.2 (KRAKEN COMMISSIONS & 1H TF) ===")
+    print("=== INICIANDO QUANT ENGINE V3.0 (WILDER ADX, RISK SIZING & SLIPPAGE) ===")
     
-    # Inicialización de estado en BD si no existe
     estado = obtener_estado()
-    if "balance_history" not in estado:
-        estado["balance_history"] = [estado.get("saldo_usd", 1000.0)]
+    if "balance_history" not in estado: estado["balance_history"] = [estado.get("saldo_usd", 1000.0)]
     guardar_estado(estado)
 
-    # Comisión base de Kraken Taker (0.26%)
     COMISION_KRAKEN = 0.0026
+    SLIPPAGE_PCT = 0.0005 # 0.05% de deslizamiento en órdenes a mercado
+    RIESGO_POR_TRADE = 0.02 # Arriesgar máximo el 2% del capital total por operación
 
     while True:
         try:
             estado = obtener_estado()
             mercado = {}
-
+            
+            # 1. ACTUALIZAR PRECIOS Y EVALUAR SALIDAS (Tick by Tick)
             for par in PARES:
                 velas = obtener_datos_kraken(par)
-                if not velas or len(velas) < 15:
-                    continue
-
-                # MEJORA: Se excluye la vela actual en formación (velas[:-1]) para evitar señales falsas
-                velas_cerradas = velas[:-1] 
-                precios = [v['close'] for v in velas_cerradas]
-                precio_actual = velas[-1]['close'] # Precio en tiempo real para evaluar salidas y entradas
-
-                rsi = calcular_rsi(precios)
-                atr = calcular_atr(velas_cerradas)
-                adx = calcular_adx(velas_cerradas)
-                vwap = calcular_vwap(velas_cerradas)
-
+                if not velas: continue
+                
+                precio_actual = velas[-1]['close']
+                velas_cerradas = velas[:-1]
+                timestamp_actual_vela_cerrada = velas_cerradas[-1]['time']
+                
                 mercado[par] = {
                     "precio": precio_actual,
-                    "rsi": rsi,
-                    "atr": atr,
-                    "adx": adx,
-                    "vwap": vwap
+                    "rsi": calcular_rsi([v['close'] for v in velas_cerradas]),
+                    "atr": calcular_atr(velas_cerradas),
+                    "adx": calcular_adx(velas_cerradas),
+                    "vwap": calcular_vwap(velas_cerradas),
+                    "time": timestamp_actual_vela_cerrada
                 }
 
-                # GESTIÓN DE POSICIÓN ABIERTA
+                # GESTIÓN DE POSICIÓN ACTIVA (Se revisa siempre para no perder el Stop Loss)
                 if estado.get("en_posicion") and estado.get("par_activo") == par:
-                    precio_compra = estado["precio_compra"]
-                    
-                    # Trailing Stop: el stop sube si el precio sube, nunca baja
-                    nuevo_stop = max(estado["stop_dinamico"], precio_actual - (1.5 * atr))
+                    nuevo_stop = max(estado["stop_dinamico"], precio_actual - (1.5 * mercado[par]["atr"]))
                     estado["stop_dinamico"] = nuevo_stop
                     
-                    take_profit_activo = estado.get("take_profit", precio_compra * 1.5)
-
-                    # Condición de Salida: Stop Loss (Trailing) o Take Profit alcanzado
-                    if precio_actual <= estado["stop_dinamico"] or precio_actual >= take_profit_activo:
-                        razon = "TAKE PROFIT" if precio_actual >= take_profit_activo else "STOP/TRAILING"
+                    if precio_actual <= estado["stop_dinamico"] or precio_actual >= estado["take_profit"]:
+                        razon = "TAKE PROFIT" if precio_actual >= estado["take_profit"] else "STOP/TRAILING"
                         
-                        # Cálculo de venta deduciendo comisiones
-                        monto_bruto = estado["cantidad_activa"] * precio_actual
-                        comision_venta = monto_bruto * COMISION_KRAKEN
-                        monto_recuperado = monto_bruto - comision_venta
+                        # Simulación de Slippage de Venta (Vendes un poco más barato)
+                        precio_ejecucion = precio_actual * (1 - SLIPPAGE_PCT)
+                        monto_bruto = estado["cantidad_activa"] * precio_ejecucion
+                        monto_recuperado = monto_bruto * (1 - COMISION_KRAKEN)
                         
-                        # PnL exacto comparando inversión bruta y retorno neto
-                        inversion_inicial = estado.get("inversion_bruta", estado["cantidad_activa"] * precio_compra)
-                        pnl_usd = monto_recuperado - inversion_inicial
-                        
+                        pnl_usd = monto_recuperado - estado["inversion_bruta"]
                         estado["saldo_usd"] += monto_recuperado
-                        estado["en_posicion"] = False
-                        estado["par_activo"] = None
+                        estado["en_posicion"], estado["par_activo"] = False, None
                         
-                        if pnl_usd >= 0:
-                            estado["trades_ganadores"] += 1
-                        else:
-                            estado["trades_perdedores"] += 1
-
-                        estado.setdefault("balance_history", []).append(round(estado["saldo_usd"], 2))
+                        if pnl_usd >= 0: estado["trades_ganadores"] += 1
+                        else: estado["trades_perdedores"] += 1
+                        estado["balance_history"].append(round(estado["saldo_usd"], 2))
                         
-                        msg = f"🔴 VENTA EJECUTADA ({razon}) [{par}] a ${precio_actual:,.2f} | PnL Neto: ${pnl_usd:+.2f} | Nuevo Saldo: ${estado['saldo_usd']:,.2f}"
+                        msg = f"🔴 VENTA ({razon}) [{par}] Ejecución: ${precio_ejecucion:,.2f} | PnL: ${pnl_usd:+.2f} | Saldo: ${estado['saldo_usd']:,.2f}"
                         registrar_evento_en_estado(estado, msg)
                         print(f"[{obtener_hora_local()}] {msg}")
 
-                # GESTIÓN DE ENTRADA (ESTRATEGIA CUANTITATIVA AL 25%)
-                elif not estado.get("en_posicion"):
-                    # Filtros estrictos ajustados: Tendencia, Fuerza (ADX > 25), Momentum (RSI > 50 quitando techo para no perder pumps)
-                    if precio_actual > vwap and adx > 25.0 and rsi >= 50.0:
-                        capital_a_invertir = estado["saldo_usd"] * 0.25 # Gestión de capital al 25%
+            estado["mercado_actual"] = mercado
+            
+            # 2. EVALUAR ENTRADAS SÓLO AL CIERRE DE LA VELA DE 1 HORA
+            # Usamos el timestamp de la última vela cerrada del primer par analizado como referencia de la red
+            timestamp_red = mercado.get(PARES[0], {}).get("time", 0)
+            
+            if not estado.get("en_posicion") and timestamp_red != estado.get("ultimo_timestamp_analizado"):
+                for par in PARES:
+                    datos = mercado.get(par)
+                    if not datos: continue
+                    
+                    # Filtros institucionales
+                    if datos["precio"] > datos["vwap"] and datos["adx"] > 25.0 and datos["rsi"] >= 50.0:
                         
-                        if capital_a_invertir >= 10.0:
-                            # Cálculo de compra descontando comisión de Kraken
-                            comision_compra = capital_a_invertir * COMISION_KRAKEN
-                            capital_efectivo = capital_a_invertir - comision_compra
-                            cantidad = capital_efectivo / precio_actual
+                        # Simulación de Slippage de Compra (Compras un poco más caro)
+                        precio_ejecucion = datos["precio"] * (1 + SLIPPAGE_PCT)
+                        
+                        # Sizing por Riesgo (Position Sizing Institucional)
+                        distancia_sl_precio = 1.5 * datos["atr"]
+                        riesgo_maximo_usd = estado["saldo_usd"] * RIESGO_POR_TRADE
+                        
+                        # ¿Cuántas monedas puedo comprar para que si cae la distancia del SL, pierda exactamente el 2%?
+                        cantidad_a_comprar = riesgo_maximo_usd / distancia_sl_precio
+                        capital_requerido = cantidad_a_comprar * precio_ejecucion
+                        
+                        # Límite de seguridad: Nunca invertir más del 95% del capital total para cubrir comisiones
+                        capital_limite = estado["saldo_usd"] * 0.95
+                        if capital_requerido > capital_limite:
+                            capital_requerido = capital_limite
+                            cantidad_a_comprar = capital_requerido / precio_ejecucion
                             
-                            estado["saldo_usd"] -= capital_a_invertir
-                            estado["en_posicion"] = True
-                            estado["par_activo"] = par
-                            estado["precio_compra"] = precio_actual
-                            estado["cantidad_activa"] = cantidad
+                        if capital_requerido >= 10.0:
+                            capital_efectivo = capital_requerido * (1 - COMISION_KRAKEN)
+                            cantidad_recibida = capital_efectivo / precio_ejecucion
                             
-                            # Establecemos Stop Loss y un objetivo de Take Profit estático a +3 veces la volatilidad
-                            estado["stop_dinamico"] = precio_actual - (1.5 * atr)
-                            estado["take_profit"] = precio_actual + (3.0 * atr)
-                            estado["inversion_bruta"] = capital_a_invertir
+                            estado["saldo_usd"] -= capital_requerido
+                            estado["en_posicion"], estado["par_activo"] = True, par
+                            estado["precio_compra"] = precio_ejecucion
+                            estado["cantidad_activa"] = cantidad_recibida
+                            estado["inversion_bruta"] = capital_requerido
+                            estado["stop_dinamico"] = precio_ejecucion - distancia_sl_precio
+                            estado["take_profit"] = precio_ejecucion + (3.0 * datos["atr"])
 
-                            msg = f"🟢 COMPRA EJECUTADA [{par}] a ${precio_actual:,.2f} | Invertido: ${capital_a_invertir:,.2f} | TP: ${estado['take_profit']:,.2f} | SL: ${estado['stop_dinamico']:,.2f}"
+                            msg = f"🟢 COMPRA [{par}] Ejecución: ${precio_ejecucion:,.2f} | Riesgo 2%: ${riesgo_maximo_usd:,.2f} | Inv: ${capital_requerido:,.2f}"
                             registrar_evento_en_estado(estado, msg)
                             print(f"[{obtener_hora_local()}] {msg}")
+                            break # Solo entra en una posición a la vez
+                
+                # Actualizamos el marcador temporal para no volver a evaluar entradas hasta dentro de 1 hora
+                estado["ultimo_timestamp_analizado"] = timestamp_red
 
-            estado["mercado_actual"] = mercado
             guardar_estado(estado)
-
+            
         except Exception as e:
-            print(f"[{obtener_hora_local()}] Error en el bucle principal: {e}")
+            print(f"[{obtener_hora_local()}] Error en el bucle: {e}")
 
-        time.sleep(120) # Pausa de 2 minutos entre escaneos
+        # Polling continuo para el Trailing Stop y Take Profit
+        time.sleep(30)
 
-# ==========================================
-# PUNTO DE ENTRADA PRINCIPAL
-# ==========================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
-    
-    # Iniciar servidor web en hilo secundario
     server = HTTPServer(('0.0.0.0', port), WebDashboardHandler)
-    t_server = threading.Thread(target=server.serve_forever)
-    t_server.daemon = True
+    t_server = threading.Thread(target=server.serve_forever, daemon=True)
     t_server.start()
     print(f"✓ Matriz PRO iniciada en puerto {port}")
-
-    # Iniciar motor cuantitativo en hilo principal
     ejecutar_bucle_quant()
