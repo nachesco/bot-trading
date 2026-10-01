@@ -1,335 +1,144 @@
 import os
+import sys
 import time
+import json
 import threading
-import pandas as pd
-import ccxt
 from datetime import datetime
-from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from pymongo import MongoClient
-from pymongo.errors import PyMongoError
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import requests
+from pymongo import MongoClient, errors
 
-# --- CONFIGURACIÓN DE RIESGO Y ESTRATEGIA PRO ---
-PARES_OPERABLES = ['BTC/USD', 'ETH/USD', 'SOL/USD']
-FEE_PCT = 0.26                 # Comisión en Kraken
-PORCENTAJE_CAPITAL = 0.25      # Invertir el 25% del saldo disponible por trade
+# ==========================================
+# CONFIGURACIÓN GENERAL Y CONEXIONES
+# ==========================================
+MONGO_URI = os.environ.get("MONGO_URI", "mongodb+srv://admin:password@cluster.mongodb.net/test?retryWrites=true&w=width")
+DB_NAME = "trading_bot_db"
+COLLECTION_NAME = "bot_state"
 
-# Gestión de Riesgo por Volatilidad (ATR)
-ATR_MULTIPLIER_STOP = 2.5      # El Stop Loss se coloca a 2.5 veces la volatilidad media
-ATR_MULTIPLIER_TRAILING = 1.5  # El bot persigue el precio a 1.5 veces la volatilidad
-TAKE_PROFIT_PCT = 5.0          # Take profit de emergencia para picos repentinos
+# Timeouts en MongoDB para evitar que la aplicación se congele por microcortes
+try:
+    mongo_client = MongoClient(
+        MONGO_URI,
+        serverSelectionTimeoutMS=5000,
+        connectTimeoutMS=5000,
+        socketTimeoutMS=5000
+    )
+    db = mongo_client[DB_NAME]
+    state_col = db[COLLECTION_NAME]
+    print("Conexión exitosa a MongoDB Atlas.")
+except Exception as e:
+    print(f"Error inicial al conectar a MongoDB: {e}")
 
-# Parámetros de Indicadores
-RSI_PERIODO = 14
-RSI_MIN = 50.0  
-RSI_MAX = 70.0  
-SMA_15M_PERIODO = 20
-SMA_1H_PERIODO = 20
-ADX_PERIODO = 14
-ADX_MIN = 25.0                 # Solo opera si hay tendencia fuerte
-VWAP_PERIODOS = 96             # VWAP rodante de 24 horas (96 velas de 15m)
+PARES = ["BTC/USD", "ETH/USD", "SOL/USD"]
 
-# --- CONEXIÓN A MONGODB (Con Timeout de Socket contra Congelamientos) ---
-MONGO_URI = os.environ.get("MONGO_URI")
-coleccion_estado = None
-
-if MONGO_URI:
-    try:
-        cliente_mongo = MongoClient(
-            MONGO_URI, 
-            serverSelectionTimeoutMS=5000,
-            socketTimeoutMS=10000,      # Cancela peticiones colgadas a los 10s
-            connectTimeoutMS=5000
-        )
-        cliente_mongo.admin.command('ping')
-        db = cliente_mongo['trading_bot']
-        coleccion_estado = db['estado']
-        print("✓ Conexión exitosa a MongoDB Atlas.", flush=True)
-    except Exception as e:
-        print(f"⚠️ Error conectando a MongoDB: {e}. Se usará memoria RAM.", flush=True)
-        coleccion_estado = None
-
-# Estado por defecto
-estado_ram = {
-    "_id": "estado_actual",
+# ==========================================
+# ESTADO INICIAL Y PERSISTENCIA
+# ==========================================
+ESTADO_DEFAULT = {
     "saldo_usd": 1000.0,
-    "cantidad_activa": 0.0,
-    "par_activo": "",
-    "capital_invertido_usd": 0.0,
-    "precio_compra": 0.0,
     "en_posicion": False,
-    "historial": [],
-    "balance_history": [1000.0],
+    "par_activo": None,
+    "precio_compra": 0.0,
+    "cantidad_activa": 0.0,
+    "stop_dinamico": 0.0,
     "trades_ganadores": 0,
     "trades_perdedores": 0,
-    "gross_profit": 0.0,
-    "gross_loss": 0.0,
-    "max_balance": 1000.0,
-    "precio_max_alcanzado": 0.0,
-    "stop_dinamico": 0.0,
-    "mercado_actual": {par: {"precio": 0.0, "rsi": 0.0, "sma15": 0.0, "adx": 0.0, "vwap": 0.0, "atr": 0.0} for par in PARES_OPERABLES}
+    "balance_history": [1000.0],
+    "historial": [],
+    "mercado_actual": {}
 }
 
-exchange_kraken = ccxt.kraken({
-    'enableRateLimit': True,
-    'timeout': 15000
-})
-
-
-# --- FUNCIONES MATEMÁTICAS / INDICADORES ---
-def calcular_rsi(series, period=14):
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -1 * delta.clip(upper=0)
-    ema_gain = gain.ewm(com=period - 1, adjust=False).mean()
-    ema_loss = loss.ewm(com=period - 1, adjust=False).mean()
-    rs = ema_gain / ema_loss
-    return 100 - (100 / (1 + rs))
-
-def calcular_adx_atr(df, period=14):
-    up = df['high'] - df['high'].shift(1)
-    down = df['low'].shift(1) - df['low']
-    
-    plus_dm = up.where((up > down) & (up > 0), 0.0)
-    minus_dm = down.where((down > up) & (down > 0), 0.0)
-    
-    tr1 = df['high'] - df['low']
-    tr2 = (df['high'] - df['close'].shift(1)).abs()
-    tr3 = (df['low'] - df['close'].shift(1)).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    
-    atr = tr.ewm(alpha=1/period, adjust=False).mean()
-    plus_di = 100 * (plus_dm.ewm(alpha=1/period, adjust=False).mean() / atr)
-    minus_di = 100 * (minus_dm.ewm(alpha=1/period, adjust=False).mean() / atr)
-    
-    dx = 100 * (abs(plus_di - minus_di) / (plus_di + minus_di))
-    adx = dx.ewm(alpha=1/period, adjust=False).mean()
-    return adx, atr
-
-def calcular_vwap(df, window=96):
-    typical_price = (df['high'] + df['low'] + df['close']) / 3
-    vwap = (typical_price * df['volume']).rolling(window=window).sum() / df['volume'].rolling(window=window).sum()
-    return vwap
-
 def obtener_hora_local():
-    return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-def registrar_evento_en_estado(estado, mensaje):
-    """Añade un evento al historial sin volver a consultar la BD (Evita corrupción de estado)."""
-    print(f"[{obtener_hora_local()}] {mensaje}", flush=True)
-    if 'historial' not in estado:
-        estado['historial'] = []
-    estado['historial'].insert(0, f"[{obtener_hora_local()}] {mensaje}")
-    estado['historial'] = estado['historial'][:40]
-
-
-# --- BASE DE DATOS ---
 def obtener_estado():
-    global estado_ram
-    if coleccion_estado is not None:
-        try:
-            doc = coleccion_estado.find_one({"_id": "estado_actual"})
-            if doc:
-                if "mercado_actual" not in doc:
-                    doc["mercado_actual"] = {}
-                for par in PARES_OPERABLES:
-                    if par not in doc["mercado_actual"]:
-                        doc["mercado_actual"][par] = {"precio": 0.0, "rsi": 0.0, "sma15": 0.0, "adx": 0.0, "vwap": 0.0, "atr": 0.0}
-                return doc
-            else:
-                coleccion_estado.insert_one(estado_ram)
-                return estado_ram.copy()
-        except PyMongoError as e:
-            print(f"⚠️ Error de lectura en Mongo: {e}", flush=True)
-            return estado_ram
-    return estado_ram
+    try:
+        doc = state_col.find_one({"_id": "main_state"})
+        if doc:
+            return doc["data"]
+    except Exception as e:
+        print(f"Error al obtener estado de MongoDB: {e}")
+    return ESTADO_DEFAULT.copy()
 
 def guardar_estado(estado):
-    global estado_ram
-    estado_ram = estado.copy()
-    if coleccion_estado is not None:
-        try:
-            coleccion_estado.update_one({"_id": "estado_actual"}, {"$set": estado}, upsert=True)
-        except PyMongoError as e:
-            print(f"⚠️ Error de escritura en Mongo: {e}", flush=True)
-
-
-# --- LÓGICA DE MERCADO ---
-def obtener_datos_mercado(par):
     try:
-        ohlcv_15m = exchange_kraken.fetch_ohlcv(par, '15m', limit=150)
-        df_15m = pd.DataFrame(ohlcv_15m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df_15m['sma_15m'] = df_15m['close'].rolling(window=SMA_15M_PERIODO).mean()
-        df_15m['rsi'] = calcular_rsi(df_15m['close'], RSI_PERIODO)
-        df_15m['vwap'] = calcular_vwap(df_15m, VWAP_PERIODOS)
-        
-        adx, atr = calcular_adx_atr(df_15m, ADX_PERIODO)
-        df_15m['adx'] = adx
-        df_15m['atr'] = atr
-
-        ohlcv_1h = exchange_kraken.fetch_ohlcv(par, '1h', limit=50)
-        df_1h = pd.DataFrame(ohlcv_1h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df_1h['sma_1h'] = df_1h['close'].rolling(window=SMA_1H_PERIODO).mean()
-
-        if len(df_15m) < VWAP_PERIODOS or df_15m.isna().iloc[-1].any():
-            return None
-
-        return {
-            'precio_actual': float(df_15m.iloc[-1]['close']),
-            'sma_15m': float(df_15m.iloc[-1]['sma_15m']),
-            'rsi': float(df_15m.iloc[-1]['rsi']),
-            'adx': float(df_15m.iloc[-1]['adx']),
-            'vwap': float(df_15m.iloc[-1]['vwap']),
-            'atr': float(df_15m.iloc[-1]['atr']),
-            'sma_1h': float(df_1h.iloc[-1]['sma_1h'])
-        }
+        state_col.update_one(
+            {"_id": "main_state"},
+            {"$set": {"data": estado, "updated_at": datetime.utcnow()}},
+            upsert=True
+        )
     except Exception as e:
-        print(f"⚠️ Error al obtener datos de {par}: {e}", flush=True)
-        return None
+        print(f"Error al guardar estado en MongoDB: {e}")
 
-
-def simular_operacion(tipo, par, precio, atr_actual=0.0):
-    estado = obtener_estado()
+def registrar_evento_en_estado(estado, mensaje):
+    timestamp = obtener_hora_local()
+    linea = f"[{timestamp}] {mensaje}"
+    if "historial" not in estado or not isinstance(estado["historial"], list):
+        estado["historial"] = []
     
-    if tipo == 'COMPRA':
-        monto_inversion = estado['saldo_usd'] * PORCENTAJE_CAPITAL
-        
-        if monto_inversion < 10.0:
-            registrar_evento_en_estado(estado, f"⚠️ Capital insuficiente para comprar {par} (Mínimo: 10 USD)")
-            guardar_estado(estado)
-            return
+    # Insertar al inicio para mostrar los eventos más recientes primero
+    estado["historial"].insert(0, linea)
+    # Limitar el historial cargado en DB a un máximo de 100 eventos
+    estado["historial"] = estado["historial"][:100]
 
-        fee = monto_inversion * (FEE_PCT / 100.0)
-        cantidad_moneda = (monto_inversion - fee) / precio
-        
-        estado['saldo_usd'] -= monto_inversion
-        estado['en_posicion'] = True
-        estado['par_activo'] = par
-        estado['cantidad_activa'] = cantidad_moneda
-        estado['capital_invertido_usd'] = monto_inversion
-        estado['precio_compra'] = precio
-        
-        estado['precio_max_alcanzado'] = precio
-        estado['stop_dinamico'] = precio - (atr_actual * ATR_MULTIPLIER_STOP)
-        
-        registrar_evento_en_estado(
-            estado, 
-            f"🟢 COMPRA {par} | P: {precio:.2f} | Inversión: {monto_inversion:.2f} USD (25%) | Stop: {estado['stop_dinamico']:.2f}"
-        )
-        
-    elif tipo in ['VENTA_STOP', 'VENTA_PROFIT', 'VENTA_TRAILING']:
-        # 🛑 GUARDIA DE SEGURIDAD: Evita procesar ventas con datos nulos o corruptos
-        if estado['cantidad_activa'] <= 0 or estado['capital_invertido_usd'] <= 0:
-            registrar_evento_en_estado(estado, f"🚨 Venta nula bloqueada en {par}. Reseteando posición sin modificar saldo.")
-            estado['en_posicion'] = False
-            estado['par_activo'] = ""
-            estado['cantidad_activa'] = 0.0
-            estado['capital_invertido_usd'] = 0.0
-            estado['precio_compra'] = 0.0
-            estado['stop_dinamico'] = 0.0
-            estado['precio_max_alcanzado'] = 0.0
-            guardar_estado(estado)
-            return
-
-        valor_bruto_venta = estado['cantidad_activa'] * precio
-        fee_venta = valor_bruto_venta * (FEE_PCT / 100.0)
-        retorno_neto = valor_bruto_venta - fee_venta
-        
-        estado['saldo_usd'] += retorno_neto
-        estado['balance_history'].append(estado['saldo_usd'])
-        
-        if estado['saldo_usd'] > estado['max_balance']:
-            estado['max_balance'] = estado['saldo_usd']
-            
-        beneficio_trade = retorno_neto - estado['capital_invertido_usd']
-        
-        if beneficio_trade > 0:
-            estado['trades_ganadores'] += 1
-            estado['gross_profit'] += beneficio_trade
-            icono = "🎯 TAKE PROFIT" if tipo == 'VENTA_PROFIT' else "🛡️ TRAILING STOP"
+# ==========================================
+# INDICADORES TÉCNICOS (CALCULADORA MOTOR)
+# ==========================================
+def calcular_rsi(precios, periodo=14):
+    if len(precios) < periodo + 1:
+        return 50.0
+    ganancias, perdidas = 0.0, 0.0
+    for i in range(1, periodo + 1):
+        diff = precios[-i] - precios[-(i + 1)]
+        if diff >= 0:
+            ganancias += diff
         else:
-            estado['trades_perdedores'] += 1
-            estado['gross_loss'] += abs(beneficio_trade)
-            icono = "🛑 STOP LOSS" if tipo == 'VENTA_STOP' else "🛡️ TRAILING STOP"
-            
-        registrar_evento_en_estado(
-            estado, 
-            f"{icono} {par} | Venta: {precio:.2f} | B/P: {beneficio_trade:+.2f} USD | Saldo: ${estado['saldo_usd']:.2f}"
-        )
-        
-        estado['en_posicion'] = False
-        estado['par_activo'] = ""
-        estado['cantidad_activa'] = 0.0
-        estado['capital_invertido_usd'] = 0.0
-        estado['precio_compra'] = 0.0
-        estado['stop_dinamico'] = 0.0
-        estado['precio_max_alcanzado'] = 0.0
-        
-    guardar_estado(estado)
+            perdidas -= diff
+    avg_gain = ganancias / periodo
+    avg_loss = perdidas / periodo
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
 
+def calcular_atr(velas, periodo=14):
+    if len(velas) < periodo + 1:
+        return 10.0
+    trs = []
+    for i in range(1, len(velas)):
+        high = velas[i]['high']
+        low = velas[i]['low']
+        prev_close = velas[i-1]['close']
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        trs.append(tr)
+    return sum(trs[-periodo:]) / periodo if trs else 10.0
 
-def analizar_y_operar():
-    estado = obtener_estado()
-    
-    if estado['en_posicion']:
-        par = estado['par_activo']
-        datos = obtener_datos_mercado(par)
-        if not datos: return
-        
-        precio = datos['precio_actual']
-        atr = datos['atr']
-        
-        estado['mercado_actual'][par] = {
-            "precio": precio, "rsi": datos['rsi'], "sma15": datos['sma_15m'], 
-            "adx": datos['adx'], "vwap": datos['vwap'], "atr": atr
-        }
-        guardar_estado(estado)
+def calcular_adx(velas, periodo=14):
+    # Cálculo simplificado de la fuerza tendencial ADX
+    if len(velas) < periodo + 1:
+        return 20.0
+    subidas = 0
+    totales = 0
+    for i in range(1, len(velas)):
+        diff = abs(velas[i]['close'] - velas[i-1]['close'])
+        totales += diff
+        if velas[i]['close'] > velas[i-1]['close']:
+            subidas += diff
+    fuerza = (subidas / totales * 100) if totales > 0 else 50
+    return round(min(max(fuerza, 15.0), 45.0), 1)
 
-        # Trailing Stop ajustado por Volatilidad (ATR)
-        if precio > estado['precio_max_alcanzado']:
-            estado['precio_max_alcanzado'] = precio
-            nuevo_stop = precio - (atr * ATR_MULTIPLIER_TRAILING)
-            if nuevo_stop > estado['stop_dinamico']:
-                estado['stop_dinamico'] = nuevo_stop
-                registrar_evento_en_estado(estado, f"🔒 Trailing ATR ajustado en {par}: {nuevo_stop:.2f}")
-                guardar_estado(estado)
+def calcular_vwap(velas):
+    if not velas:
+        return 0.0
+    vol_total = sum(v['volume'] for v in velas)
+    if vol_total == 0:
+        return velas[-1]['close']
+    pv_total = sum(((v['high'] + v['low'] + v['close']) / 3.0) * v['volume'] for v in velas)
+    return pv_total / vol_total
 
-        if precio <= estado['stop_dinamico']:
-            simular_operacion('VENTA_TRAILING' if estado['stop_dinamico'] > estado['precio_compra'] else 'VENTA_STOP', par, precio)
-        elif precio >= estado['precio_compra'] * (1.0 + TAKE_PROFIT_PCT/100.0):
-            simular_operacion('VENTA_PROFIT', par, precio)
-             
-    else:
-        for par in PARES_OPERABLES:
-            datos = obtener_datos_mercado(par)
-            if not datos: continue
-            
-            precio = datos['precio_actual']
-            sma_15m = datos['sma_15m']
-            sma_1h = datos['sma_1h']
-            rsi = datos['rsi']
-            adx = datos['adx']
-            vwap = datos['vwap']
-            atr = datos['atr']
-            
-            estado['mercado_actual'][par] = {
-                "precio": precio, "rsi": rsi, "sma15": sma_15m, 
-                "adx": adx, "vwap": vwap, "atr": atr
-            }
-            guardar_estado(estado)
-            
-            # FILTROS PRO DE ENTRADA
-            tendencia_15m = precio > sma_15m
-            tendencia_1h = precio > sma_1h
-            impulso_rsi = RSI_MIN < rsi < RSI_MAX
-            fuerza_tendencia = adx > ADX_MIN
-            confirmacion_volumen = precio > vwap
-            
-            if tendencia_15m and tendencia_1h and impulso_rsi and fuerza_tendencia and confirmacion_volumen:
-                simular_operacion('COMPRA', par, precio, atr)
-                break 
-
-
-# --- SERVIDOR WEB ---
+# ==========================================
+# PLANTILLA HTML DEL DASHBOARD
+# ==========================================
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="es">
@@ -339,6 +148,7 @@ HTML_TEMPLATE = """
     <title>Quant Bot | Pro Analytics</title>
     <meta http-equiv="refresh" content="15">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         :root {{
             --bg-dark: #0b0e14;
@@ -372,10 +182,14 @@ HTML_TEMPLATE = """
         .market-row {{ display: flex; justify-content: space-between; align-items: center; border-bottom: 1px dashed var(--border); padding-bottom: 8px; font-size: 0.9rem; }}
         .market-row:last-child {{ border-bottom: none; padding-bottom: 0; }}
         .badge {{ padding: 4px 10px; border-radius: 6px; font-size: 0.75rem; font-weight: 800; letter-spacing: 0.5px; text-transform: uppercase; }}
-        .section-title {{ font-size: 1.2rem; border-bottom: 1px solid var(--border); padding-bottom: 10px; margin: 35px 0 15px 0; display: flex; align-items: center; gap: 8px;}}
-        .logs-container {{ background: #000; border: 1px solid var(--border); border-radius: 12px; padding: 15px; height: 300px; overflow-y: auto; font-family: 'Consolas', 'Courier New', monospace; font-size: 0.85rem; color: #a9b1d6; box-shadow: inset 0 2px 10px rgba(0,0,0,0.5);}}
+        .section-header {{ display: flex; justify-content: space-between; align-items: center; margin: 35px 0 15px 0; border-bottom: 1px solid var(--border); padding-bottom: 10px; }}
+        .section-title {{ font-size: 1.2rem; margin: 0; display: flex; align-items: center; gap: 8px; }}
+        .btn-clean {{ background: var(--bg-card); color: var(--text-muted); border: 1px solid var(--border); padding: 6px 14px; border-radius: 8px; text-decoration: none; font-size: 0.8rem; font-weight: 600; transition: all 0.2s ease; }}
+        .btn-clean:hover {{ color: var(--danger); border-color: var(--danger); }}
+        .logs-container {{ background: #000; border: 1px solid var(--border); border-radius: 12px; padding: 15px; height: 300px; overflow-y: auto; font-family: 'Consolas', 'Courier New', monospace; font-size: 0.85rem; color: #a9b1d6; box-shadow: inset 0 2px 10px rgba(0,0,0,0.5); }}
         .log-line {{ margin-bottom: 8px; padding-bottom: 8px; border-bottom: 1px solid #1a1b26; line-height: 1.4; }}
         .log-line:last-child {{ border: none; }}
+        .chart-container {{ position: relative; height: 260px; width: 100%; margin-top: 10px; }}
         ::-webkit-scrollbar {{ width: 8px; }}
         ::-webkit-scrollbar-track {{ background: var(--bg-dark); }}
         ::-webkit-scrollbar-thumb {{ background: var(--border); border-radius: 4px; }}
@@ -415,52 +229,140 @@ HTML_TEMPLATE = """
 
         {posicion_html}
 
-        <h2 class="section-title">📡 Matriz de Análisis</h2>
+        <div class="card" style="margin-bottom: 20px;">
+            <div class="card-title">📈 Curva de Equidad (Evolución de Capital)</div>
+            <div class="chart-container">
+                <canvas id="equityChart"></canvas>
+            </div>
+        </div>
+
+        <div class="section-header">
+            <h2 class="section-title">📡 Matriz de Análisis</h2>
+        </div>
         <div class="grid-3">
             {mercado_html}
         </div>
 
-        <h2 class="section-title">📝 Terminal de Eventos</h2>
+        <div class="section-header">
+            <h2 class="section-title">📝 Terminal de Eventos</h2>
+            <a href="/limpiar" class="btn-clean">🗑️ Limpiar Terminal</a>
+        </div>
         <div class="logs-container">
             {historial_html}
         </div>
     </div>
+
+    <script>
+        const balanceData = {balance_data_json};
+        const balanceLabels = {balance_labels_json};
+
+        const ctx = document.getElementById('equityChart').getContext('2d');
+        const gradient = ctx.createLinearGradient(0, 0, 0, 260);
+        gradient.addColorStop(0, 'rgba(59, 130, 246, 0.35)');
+        gradient.addColorStop(1, 'rgba(59, 130, 246, 0.0)');
+
+        new Chart(ctx, {{
+            type: 'line',
+            data: {{
+                labels: balanceLabels,
+                datasets: [{{
+                    label: 'Saldo Total ($)',
+                    data: balanceData,
+                    borderColor: '#3b82f6',
+                    borderWidth: 2.5,
+                    backgroundColor: gradient,
+                    fill: true,
+                    tension: 0.3,
+                    pointRadius: 4,
+                    pointHoverRadius: 6,
+                    pointBackgroundColor: '#10b981'
+                }}]
+            }},
+            options: {{
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {{
+                    legend: {{ display: false }},
+                    tooltip: {{
+                        callbacks: {{
+                            label: function(context) {{
+                                return 'Saldo: $' + context.parsed.y.toFixed(2);
+                            }}
+                        }}
+                    }}
+                }},
+                scales: {{
+                    x: {{
+                        grid: {{ color: '#1a1b26', drawBorder: false }},
+                        ticks: {{ color: '#8b9bb4', font: {{ family: 'Inter' }} }}
+                    }},
+                    y: {{
+                        grid: {{ color: '#2a2e39', drawBorder: false }},
+                        ticks: {{ 
+                            color: '#8b9bb4', 
+                            font: {{ family: 'Inter' }},
+                            callback: function(value) {{ return '$' + value; }}
+                        }}
+                    }}
+                }}
+            }}
+        }});
+    </script>
 </body>
 </html>
 """
 
+# ==========================================
+# SERVIDOR WEB Y CONTROLADOR HTTP
+# ==========================================
 class WebDashboardHandler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args): pass 
+    def log_message(self, format, *args):
+        pass
 
     def do_GET(self):
+        if self.path == '/limpiar':
+            estado = obtener_estado()
+            estado['historial'] = []
+            registrar_evento_en_estado(estado, "🧹 Terminal de eventos limpiada correctamente.")
+            guardar_estado(estado)
+            self.send_response(302)
+            self.send_header('Location', '/')
+            self.end_headers()
+            return
+
         self.send_response(200)
         self.send_header('Content-type', 'text/html; charset=utf-8')
         self.end_headers()
-        
-        estado = obtener_estado()
-        
-        total_trades = estado['trades_ganadores'] + estado['trades_perdedores']
-        win_rate = (estado['trades_ganadores'] / total_trades * 100) if total_trades > 0 else 0.0
 
-        if estado['en_posicion']:
+        estado = obtener_estado()
+        total_trades = estado.get('trades_ganadores', 0) + estado.get('trades_perdedores', 0)
+        win_rate = (estado.get('trades_ganadores', 0) / total_trades * 100) if total_trades > 0 else 0.0
+
+        history = estado.get('balance_history', [1000.0])
+        balance_data_json = json.dumps(history)
+        balance_labels_json = json.dumps([f"Trade {i}" if i > 0 else "Inicio" for i in range(len(history))])
+
+        if estado.get('en_posicion'):
             estado_str = "EN POSICIÓN"
             dot_class = "dot-active"
             text_status_class = "text-success"
-            precio_actual = estado['mercado_actual'].get(estado['par_activo'], {}).get('precio', estado['precio_compra'])
-            
-            valor_actual_posicion = estado['cantidad_activa'] * precio_actual
-            equidad = estado['saldo_usd'] + valor_actual_posicion
-            pnl = ((precio_actual - estado['precio_compra']) / estado['precio_compra']) * 100 if estado['precio_compra'] > 0 else 0.0
+            par = estado.get('par_activo', 'BTC/USD')
+            precio_compra = estado.get('precio_compra', 0.0)
+            precio_actual = estado.get('mercado_actual', {}).get(par, {}).get('precio', precio_compra)
+
+            valor_actual_posicion = estado.get('cantidad_activa', 0.0) * precio_actual
+            equidad = estado.get('saldo_usd', 0.0) + valor_actual_posicion
+            pnl = ((precio_actual - precio_compra) / precio_compra) * 100 if precio_compra > 0 else 0.0
             pnl_class = "text-success" if pnl >= 0 else "text-danger"
-            
+
             pos_html = f"""
             <div class="card active-trade" style="margin-bottom: 20px;">
-                <div class="card-title" style="color: var(--success); font-size: 1rem;">🟢 OPERACIÓN ACTIVA: {estado['par_activo']}</div>
+                <div class="card-title" style="color: var(--success); font-size: 1rem;">🟢 OPERACIÓN ACTIVA: {par}</div>
                 <div class="grid-4" style="margin-bottom: 0;">
-                    <div><span style="color: var(--text-muted); font-size: 0.85rem;">Precio de Compra</span><br><strong>${estado['precio_compra']:,.2f}</strong></div>
+                    <div><span style="color: var(--text-muted); font-size: 0.85rem;">Precio de Compra</span><br><strong>${precio_compra:,.2f}</strong></div>
                     <div><span style="color: var(--text-muted); font-size: 0.85rem;">Precio Actual</span><br><strong>${precio_actual:,.2f}</strong></div>
                     <div><span style="color: var(--text-muted); font-size: 0.85rem;">P&L Abierto</span><br><strong class="{pnl_class}">{pnl:+.2f}%</strong></div>
-                    <div><span style="color: var(--text-muted); font-size: 0.85rem;">Stop ATR Dinámico</span><br><strong class="text-danger">${estado['stop_dinamico']:,.2f}</strong></div>
+                    <div><span style="color: var(--text-muted); font-size: 0.85rem;">Stop ATR Dinámico</span><br><strong class="text-danger">${estado.get('stop_dinamico', 0.0):,.2f}</strong></div>
                 </div>
             </div>
             """
@@ -468,23 +370,23 @@ class WebDashboardHandler(BaseHTTPRequestHandler):
             estado_str = "ESCANEO ACTIVO"
             dot_class = "dot-waiting"
             text_status_class = "text-warning"
-            equidad = estado['saldo_usd']
+            equidad = estado.get('saldo_usd', 1000.0)
             pos_html = ""
 
         mercado_bloques = ""
-        for par, datos in estado['mercado_actual'].items():
+        for par, datos in estado.get('mercado_actual', {}).items():
             is_active = (par == estado.get('par_activo'))
             active_style = "border-color: var(--success);" if is_active else ""
-            
-            rsi = datos.get('rsi', 0)
+
+            rsi = datos.get('rsi', 50)
             if rsi > 70: rsi_color, rsi_text = "var(--danger)", "#fff"
             elif rsi > 50: rsi_color, rsi_text = "var(--success)", "#fff"
             else: rsi_color, rsi_text = "#2a2e39", "var(--text-main)"
-            
-            adx = datos.get('adx', 0)
+
+            adx = datos.get('adx', 20)
             if adx > 25: adx_color, adx_label = "var(--success)", "Fuerte"
             else: adx_color, adx_label = "#2a2e39", "Débil/Lateral"
-            
+
             vwap = datos.get('vwap', 0)
             precio = datos.get('precio', 0)
             if precio > vwap: vwap_color, vwap_label = "var(--success)", "Soporte (Alcista)"
@@ -516,7 +418,8 @@ class WebDashboardHandler(BaseHTTPRequestHandler):
             </div>
             """
 
-        historial = "".join([f"<div class='log-line'>{linea}</div>" for linea in estado.get('historial', [])])
+        historial_list = estado.get('historial', [])
+        historial = "".join([f"<div class='log-line'>{linea}</div>" for linea in historial_list])
         if not historial: historial = "<div class='log-line'>Sistema inicializado. Analizando mercados...</div>"
 
         html_final = HTML_TEMPLATE.format(
@@ -524,32 +427,146 @@ class WebDashboardHandler(BaseHTTPRequestHandler):
             dot_class=dot_class,
             estado_str=estado_str,
             text_status_class=text_status_class,
-            saldo_usd=f"{estado['saldo_usd']:,.2f}",
+            saldo_usd=f"{estado.get('saldo_usd', 1000.0):,.2f}",
             equidad_estimada=f"{equidad:,.2f}",
             win_rate=f"{win_rate:.1f}",
-            trades_ganadores=estado['trades_ganadores'],
-            trades_perdedores=estado['trades_perdedores'],
+            trades_ganadores=estado.get('trades_ganadores', 0),
+            trades_perdedores=estado.get('trades_perdedores', 0),
             mercado_html=mercado_bloques,
             posicion_html=pos_html,
-            historial_html=historial
+            historial_html=historial,
+            balance_data_json=balance_data_json,
+            balance_labels_json=balance_labels_json
         )
         self.wfile.write(html_final.encode('utf-8'))
 
-def iniciar_servidor_web():
-    port = int(os.environ.get("PORT", 8080))
-    server = ThreadingHTTPServer(('0.0.0.0', port), WebDashboardHandler)
-    print(f"✓ Matriz PRO iniciada en puerto {port}", flush=True)
-    server.serve_forever()
+# ==========================================
+# MOTOR CUANTITATIVO Y BUCLE DE TRADING
+# ==========================================
+def obtener_datos_kraken(pair_symbol):
+    m_map = {"BTC/USD": "XXBTZUSD", "ETH/USD": "XETHZUSD", "SOL/USD": "SOLUSD"}
+    symbol = m_map.get(pair_symbol, "XXBTZUSD")
+    try:
+        url = f"https://api.kraken.com/0/public/OHLC?pair={symbol}&interval=15"
+        res = requests.get(url, timeout=5).json()
+        if res.get("error"):
+            return None
+        key = list(res["result"].keys())[0]
+        raw_candles = res["result"][key]
+        velas = []
+        for c in raw_candles[-30:]:
+            velas.append({
+                'time': c[0],
+                'open': float(c[1]),
+                'high': float(c[2]),
+                'low': float(c[3]),
+                'close': float(c[4]),
+                'vwap': float(c[5]),
+                'volume': float(c[6])
+            })
+        return velas
+    except Exception as e:
+        return None
 
-
-if __name__ == "__main__":
-    print(f"=== INICIANDO QUANT ENGINE V2.1 (FIXED) ===", flush=True)
-    threading.Thread(target=iniciar_servidor_web, daemon=True).start()
+def ejecutar_bucle_quant():
+    print("=== INICIANDO QUANT ENGINE V2.1 (FIXED & IMPROVED) ===")
+    
+    # Inicialización de estado en BD si no existe
+    estado = obtener_estado()
+    if "balance_history" not in estado:
+        estado["balance_history"] = [estado.get("saldo_usd", 1000.0)]
+    guardar_estado(estado)
 
     while True:
         try:
-            analizar_y_operar()
+            estado = obtener_estado()
+            mercado = {}
+
+            for par in PARES:
+                velas = obtener_datos_kraken(par)
+                if not velas or len(velas) < 15:
+                    continue
+
+                precios = [v['close'] for v in velas]
+                precio_actual = precios[-1]
+                rsi = calcular_rsi(precios)
+                atr = calcular_atr(velas)
+                adx = calcular_adx(velas)
+                vwap = calcular_vwap(velas)
+
+                mercado[par] = {
+                    "precio": precio_actual,
+                    "rsi": rsi,
+                    "atr": atr,
+                    "adx": adx,
+                    "vwap": vwap
+                }
+
+                # GESTIÓN DE POSICIÓN ABIERTA
+                if estado.get("en_posicion") and estado.get("par_activo") == par:
+                    precio_compra = estado["precio_compra"]
+                    nuevo_stop = max(estado["stop_dinamico"], precio_actual - (1.5 * atr))
+                    estado["stop_dinamico"] = nuevo_stop
+
+                    # Condición de Salida (Stop Loss o Trailing Stop)
+                    if precio_actual <= estado["stop_dinamico"]:
+                        monto_recuperado = estado["cantidad_activa"] * precio_actual
+                        pnl_usd = monto_recuperado - (estado["cantidad_activa"] * precio_compra)
+                        
+                        estado["saldo_usd"] += monto_recuperado
+                        estado["en_posicion"] = False
+                        estado["par_activo"] = None
+                        
+                        if pnl_usd >= 0:
+                            estado["trades_ganadores"] += 1
+                        else:
+                            estado["trades_perdedores"] += 1
+
+                        estado.setdefault("balance_history", []).append(round(estado["saldo_usd"], 2))
+                        
+                        msg = f"🔴 VENTA EJECUTADA [{par}] a ${precio_actual:,.2f} | PnL: ${pnl_usd:+.2f} | Nuevo Saldo: ${estado['saldo_usd']:,.2f}"
+                        registrar_evento_en_estado(estado, msg)
+                        print(f"[{obtener_hora_local()}] {msg}")
+
+                # GESTIÓN DE ENTRADA (ESTRATEGIA CUANTITATIVA AL 25%)
+                elif not estado.get("en_posicion"):
+                    # Filtros estrictos: Tendencia (Precio > VWAP), Fuerza (ADX > 25), Momentum (RSI entre 50 y 65)
+                    if precio_actual > vwap and adx > 25.0 and 50.0 <= rsi <= 65.0:
+                        capital_a_invertir = estado["saldo_usd"] * 0.25 # Gestión de capital al 25%
+                        
+                        if capital_a_invertir >= 10.0:
+                            cantidad = capital_a_invertir / precio_actual
+                            estado["saldo_usd"] -= capital_a_invertir
+                            estado["en_posicion"] = True
+                            estado["par_activo"] = par
+                            estado["precio_compra"] = precio_actual
+                            estado["cantidad_activa"] = cantidad
+                            estado["stop_dinamico"] = precio_actual - (1.5 * atr)
+
+                            msg = f"🟢 COMPRA EJECUTADA [{par}] a ${precio_actual:,.2f} | Invertido: ${capital_a_invertir:,.2f} (25%) | Stop Inicial: ${estado['stop_dinamico']:,.2f}"
+                            registrar_evento_en_estado(estado, msg)
+                            print(f"[{obtener_hora_local()}] {msg}")
+
+            estado["mercado_actual"] = mercado
+            guardar_estado(estado)
+
         except Exception as e:
-            print(f"[{obtener_hora_local()}] ❌ Error crítico: {e}", flush=True)
-            time.sleep(10)
-        time.sleep(120)
+            print(f"[{obtener_hora_local()}] Error en el bucle principal: {e}")
+
+        time.sleep(120) # Pausa de 2 minutos entre escaneos
+
+# ==========================================
+# PUNTO DE ENTRADA PRINCIPAL
+# ==========================================
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    
+    # Iniciar servidor web en hilo secundario
+    server = HTTPServer(('0.0.0.0', port), WebDashboardHandler)
+    t_server = threading.Thread(target=server.serve_forever)
+    t_server.daemon = True
+    t_server.start()
+    print(f"✓ Matriz PRO iniciada en puerto {port}")
+
+    # Iniciar motor cuantitativo en hilo principal
+    ejecutar_bucle_quant()
