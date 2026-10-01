@@ -28,13 +28,16 @@ try:
 except Exception as e:
     print(f"Error inicial al conectar a MongoDB: {e}")
 
+# Mapeo unificado de pares (DRY) y límites mínimos de volumen por activo en Kraken
 PARES = ["BTC/USD", "ETH/USD", "SOL/USD"]
+MAPA_PARES = {"BTC/USD": "XXBTZUSD", "ETH/USD": "XETHZUSD", "SOL/USD": "SOLUSD"}
+MINIMOS_KRAKEN = {"BTC/USD": 0.0001, "ETH/USD": 0.01, "SOL/USD": 0.1}
 
 # ==========================================
 # ESTADO INICIAL Y PERSISTENCIA
 # ==========================================
 ESTADO_DEFAULT = {
-    "saldo_usd": 1000.0,
+    "saldo_usd": 1000.0, # Testeable, cuando pases a real aquí se leerá de la API
     "en_posicion": False,
     "par_activo": None,
     "precio_compra": 0.0,
@@ -105,10 +108,8 @@ def calcular_adx(velas, periodo=14):
         high, low = velas[i]['high'], velas[i]['low']
         prev_high, prev_low, prev_close = velas[i-1]['high'], velas[i-1]['low'], velas[i-1]['close']
         
-        # True Range
         trs.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
         
-        # Movimientos Direccionales
         up_move = high - prev_high
         down_move = prev_low - low
         
@@ -315,8 +316,7 @@ class WebDashboardHandler(BaseHTTPRequestHandler):
 # MOTOR CUANTITATIVO Y BUCLE DE TRADING
 # ==========================================
 def obtener_datos_kraken(pair_symbol):
-    m_map = {"BTC/USD": "XXBTZUSD", "ETH/USD": "XETHZUSD", "SOL/USD": "SOLUSD"}
-    symbol = m_map.get(pair_symbol, "XXBTZUSD")
+    symbol = MAPA_PARES.get(pair_symbol, "XXBTZUSD")
     try:
         url = f"https://api.kraken.com/0/public/OHLC?pair={symbol}&interval=60"
         res = requests.get(url, timeout=5).json()
@@ -326,22 +326,23 @@ def obtener_datos_kraken(pair_symbol):
     except Exception: return None
 
 def ejecutar_bucle_quant():
-    print("=== INICIANDO QUANT ENGINE V3.0 (WILDER ADX, RISK SIZING & SLIPPAGE) ===")
+    print("=== INICIANDO QUANT ENGINE V3.1 (OPTIMIZADO I/O & VOLUMEN KRAKEN) ===")
     
     estado = obtener_estado()
     if "balance_history" not in estado: estado["balance_history"] = [estado.get("saldo_usd", 1000.0)]
     guardar_estado(estado)
 
     COMISION_KRAKEN = 0.0026
-    SLIPPAGE_PCT = 0.0005 # 0.05% de deslizamiento en órdenes a mercado
-    RIESGO_POR_TRADE = 0.02 # Arriesgar máximo el 2% del capital total por operación
+    SLIPPAGE_PCT = 0.0005
+    RIESGO_POR_TRADE = 0.02
 
     while True:
         try:
             estado = obtener_estado()
             mercado = {}
+            estado_cambiado = False  # OPTIMIZACIÓN 1: Solo guardaremos en BBDD si hay cambios reales
             
-            # 1. ACTUALIZAR PRECIOS Y EVALUAR SALIDAS (Tick by Tick)
+            # 1. ACTUALIZAR PRECIOS Y EVALUAR SALIDAS
             for par in PARES:
                 velas = obtener_datos_kraken(par)
                 if not velas: continue
@@ -359,15 +360,16 @@ def ejecutar_bucle_quant():
                     "time": timestamp_actual_vela_cerrada
                 }
 
-                # GESTIÓN DE POSICIÓN ACTIVA (Se revisa siempre para no perder el Stop Loss)
+                # GESTIÓN DE POSICIÓN ACTIVA
                 if estado.get("en_posicion") and estado.get("par_activo") == par:
                     nuevo_stop = max(estado["stop_dinamico"], precio_actual - (1.5 * mercado[par]["atr"]))
-                    estado["stop_dinamico"] = nuevo_stop
+                    if nuevo_stop != estado["stop_dinamico"]:
+                        estado["stop_dinamico"] = nuevo_stop
+                        estado_cambiado = True
                     
                     if precio_actual <= estado["stop_dinamico"] or precio_actual >= estado["take_profit"]:
                         razon = "TAKE PROFIT" if precio_actual >= estado["take_profit"] else "STOP/TRAILING"
                         
-                        # Simulación de Slippage de Venta (Vendes un poco más barato)
                         precio_ejecucion = precio_actual * (1 - SLIPPAGE_PCT)
                         monto_bruto = estado["cantidad_activa"] * precio_ejecucion
                         monto_recuperado = monto_bruto * (1 - COMISION_KRAKEN)
@@ -383,42 +385,41 @@ def ejecutar_bucle_quant():
                         msg = f"🔴 VENTA ({razon}) [{par}] Ejecución: ${precio_ejecucion:,.2f} | PnL: ${pnl_usd:+.2f} | Saldo: ${estado['saldo_usd']:,.2f}"
                         registrar_evento_en_estado(estado, msg)
                         print(f"[{obtener_hora_local()}] {msg}")
+                        estado_cambiado = True
 
             estado["mercado_actual"] = mercado
             
-            # 2. EVALUAR ENTRADAS SÓLO AL CIERRE DE LA VELA DE 1 HORA
-            # Usamos el timestamp de la última vela cerrada del primer par analizado como referencia de la red
-            timestamp_red = mercado.get(PARES[0], {}).get("time", 0)
+            # 2. EVALUAR ENTRADAS AL CIERRE DE VELA
+            # OPTIMIZACIÓN 2: Evitar ceguera de timestamp obteniendo el máximo disponible de la red entera
+            timestamp_red = max([d.get("time", 0) for d in mercado.values()], default=0)
             
             if not estado.get("en_posicion") and timestamp_red != estado.get("ultimo_timestamp_analizado"):
+                estado_cambiado = True # Garantiza guardar al menos una vez por hora el nuevo timestamp
+                
                 for par in PARES:
                     datos = mercado.get(par)
                     if not datos: continue
                     
-                    # Filtros institucionales
                     if datos["precio"] > datos["vwap"] and datos["adx"] > 25.0 and datos["rsi"] >= 50.0:
-                        
-                        # Simulación de Slippage de Compra (Compras un poco más caro)
                         precio_ejecucion = datos["precio"] * (1 + SLIPPAGE_PCT)
                         
-                        # Sizing por Riesgo (Position Sizing Institucional)
                         distancia_sl_precio = 1.5 * datos["atr"]
                         riesgo_maximo_usd = estado["saldo_usd"] * RIESGO_POR_TRADE
                         
-                        # ¿Cuántas monedas puedo comprar para que si cae la distancia del SL, pierda exactamente el 2%?
                         cantidad_a_comprar = riesgo_maximo_usd / distancia_sl_precio
                         capital_requerido = cantidad_a_comprar * precio_ejecucion
                         
-                        # Límite de seguridad: Nunca invertir más del 95% del capital total para cubrir comisiones
                         capital_limite = estado["saldo_usd"] * 0.95
                         if capital_requerido > capital_limite:
                             capital_requerido = capital_limite
                             cantidad_a_comprar = capital_requerido / precio_ejecucion
                             
-                        if capital_requerido >= 10.0:
-                            capital_efectivo = capital_requerido * (1 - COMISION_KRAKEN)
-                            cantidad_recibida = capital_efectivo / precio_ejecucion
-                            
+                        # OPTIMIZACIÓN 3: Verificación oficial de volúmenes mínimos en Kraken
+                        minimo_requerido = MINIMOS_KRAKEN.get(par, 0.0)
+                        capital_efectivo = capital_requerido * (1 - COMISION_KRAKEN)
+                        cantidad_recibida = capital_efectivo / precio_ejecucion
+                        
+                        if cantidad_recibida >= minimo_requerido:
                             estado["saldo_usd"] -= capital_requerido
                             estado["en_posicion"], estado["par_activo"] = True, par
                             estado["precio_compra"] = precio_ejecucion
@@ -430,17 +431,21 @@ def ejecutar_bucle_quant():
                             msg = f"🟢 COMPRA [{par}] Ejecución: ${precio_ejecucion:,.2f} | Riesgo 2%: ${riesgo_maximo_usd:,.2f} | Inv: ${capital_requerido:,.2f}"
                             registrar_evento_en_estado(estado, msg)
                             print(f"[{obtener_hora_local()}] {msg}")
-                            break # Solo entra en una posición a la vez
+                            estado_cambiado = True
+                            break 
+                        else:
+                            msg_rechazo = f"⚠️ OMITIDO [{par}]: Volumen {cantidad_recibida:.5f} no supera mínimo Kraken de {minimo_requerido}"
+                            print(f"[{obtener_hora_local()}] {msg_rechazo}")
                 
-                # Actualizamos el marcador temporal para no volver a evaluar entradas hasta dentro de 1 hora
                 estado["ultimo_timestamp_analizado"] = timestamp_red
 
-            guardar_estado(estado)
+            # OPTIMIZACIÓN 4: Escritura eficiente en MongoDB Atlas
+            if estado_cambiado:
+                guardar_estado(estado)
             
         except Exception as e:
             print(f"[{obtener_hora_local()}] Error en el bucle: {e}")
 
-        # Polling continuo para el Trailing Stop y Take Profit
         time.sleep(30)
 
 if __name__ == "__main__":
