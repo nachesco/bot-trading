@@ -3,7 +3,7 @@ import sys
 import time
 import json
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import requests
 from pymongo import MongoClient, errors
@@ -11,7 +11,7 @@ from pymongo import MongoClient, errors
 # ==========================================
 # CONFIGURACIÓN GENERAL Y CONEXIONES
 # ==========================================
-MONGO_URI = os.environ.get("MONGO_URI", "mongodb+srv://admin:password@cluster.mongodb.net/test?retryWrites=true&w=width")
+MONGO_URI = os.environ.get("MONGO_URI", "mongodb+srv://admin:password@cluster.mongodb.net/test?retryWrites=true&w=majority")
 DB_NAME = "trading_bot_db"
 COLLECTION_NAME = "bot_state"
 
@@ -70,9 +70,10 @@ def obtener_estado():
 
 def guardar_estado(estado):
     try:
+        # CORRECCIÓN DE DEPRECATION WARNING: Usar datetime.now(timezone.utc)
         state_col.update_one(
             {"_id": "main_state"},
-            {"$set": {"data": estado, "updated_at": datetime.utcnow()}},
+            {"$set": {"data": estado, "updated_at": datetime.now(timezone.utc)}},
             upsert=True
         )
     except Exception as e:
@@ -340,9 +341,8 @@ def ejecutar_bucle_quant():
         try:
             estado = obtener_estado()
             mercado = {}
-            estado_cambiado = False  # OPTIMIZACIÓN 1: Solo guardaremos en BBDD si hay cambios reales
+            estado_cambiado = False
             
-            # 1. ACTUALIZAR PRECIOS Y EVALUAR SALIDAS
             for par in PARES:
                 velas = obtener_datos_kraken(par)
                 if not velas: continue
@@ -360,7 +360,6 @@ def ejecutar_bucle_quant():
                     "time": timestamp_actual_vela_cerrada
                 }
 
-                # GESTIÓN DE POSICIÓN ACTIVA
                 if estado.get("en_posicion") and estado.get("par_activo") == par:
                     nuevo_stop = max(estado["stop_dinamico"], precio_actual - (1.5 * mercado[par]["atr"]))
                     if nuevo_stop != estado["stop_dinamico"]:
@@ -389,12 +388,10 @@ def ejecutar_bucle_quant():
 
             estado["mercado_actual"] = mercado
             
-            # 2. EVALUAR ENTRADAS AL CIERRE DE VELA
-            # OPTIMIZACIÓN 2: Evitar ceguera de timestamp obteniendo el máximo disponible de la red entera
             timestamp_red = max([d.get("time", 0) for d in mercado.values()], default=0)
             
             if not estado.get("en_posicion") and timestamp_red != estado.get("ultimo_timestamp_analizado"):
-                estado_cambiado = True # Garantiza guardar al menos una vez por hora el nuevo timestamp
+                estado_cambiado = True
                 
                 for par in PARES:
                     datos = mercado.get(par)
@@ -414,7 +411,6 @@ def ejecutar_bucle_quant():
                             capital_requerido = capital_limite
                             cantidad_a_comprar = capital_requerido / precio_ejecucion
                             
-                        # OPTIMIZACIÓN 3: Verificación oficial de volúmenes mínimos en Kraken
                         minimo_requerido = MINIMOS_KRAKEN.get(par, 0.0)
                         capital_efectivo = capital_requerido * (1 - COMISION_KRAKEN)
                         cantidad_recibida = capital_efectivo / precio_ejecucion
@@ -439,7 +435,6 @@ def ejecutar_bucle_quant():
                 
                 estado["ultimo_timestamp_analizado"] = timestamp_red
 
-            # OPTIMIZACIÓN 4: Escritura eficiente en MongoDB Atlas
             if estado_cambiado:
                 guardar_estado(estado)
             
