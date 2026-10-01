@@ -11,6 +11,7 @@ from pymongo.errors import PyMongoError
 # --- CONFIGURACIÓN DE RIESGO Y ESTRATEGIA PRO ---
 PARES_OPERABLES = ['BTC/USD', 'ETH/USD', 'SOL/USD']
 FEE_PCT = 0.26                 # Comisión en Kraken
+PORCENTAJE_CAPITAL = 0.25      # Invertir el 25% del saldo disponible por trade
 
 # Gestión de Riesgo por Volatilidad (ATR)
 ATR_MULTIPLIER_STOP = 2.5      # El Stop Loss se coloca a 2.5 veces la volatilidad media
@@ -27,13 +28,18 @@ ADX_PERIODO = 14
 ADX_MIN = 25.0                 # Solo opera si hay tendencia fuerte
 VWAP_PERIODOS = 96             # VWAP rodante de 24 horas (96 velas de 15m)
 
-# --- CONEXIÓN A MONGODB ---
+# --- CONEXIÓN A MONGODB (Con Timeout de Socket contra Congelamientos) ---
 MONGO_URI = os.environ.get("MONGO_URI")
 coleccion_estado = None
 
 if MONGO_URI:
     try:
-        cliente_mongo = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+        cliente_mongo = MongoClient(
+            MONGO_URI, 
+            serverSelectionTimeoutMS=5000,
+            socketTimeoutMS=10000,      # Cancela peticiones colgadas a los 10s
+            connectTimeoutMS=5000
+        )
         cliente_mongo.admin.command('ping')
         db = cliente_mongo['trading_bot']
         coleccion_estado = db['estado']
@@ -69,7 +75,7 @@ exchange_kraken = ccxt.kraken({
 })
 
 
-# --- FUNCIONES MATEMÁTICAS / INDICADORES (Puro Pandas) ---
+# --- FUNCIONES MATEMÁTICAS / INDICADORES ---
 def calcular_rsi(series, period=14):
     delta = series.diff()
     gain = delta.clip(lower=0)
@@ -107,12 +113,13 @@ def calcular_vwap(df, window=96):
 def obtener_hora_local():
     return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-def registrar_evento(mensaje):
+def registrar_evento_en_estado(estado, mensaje):
+    """Añade un evento al historial sin volver a consultar la BD (Evita corrupción de estado)."""
     print(f"[{obtener_hora_local()}] {mensaje}", flush=True)
-    estado = obtener_estado()
+    if 'historial' not in estado:
+        estado['historial'] = []
     estado['historial'].insert(0, f"[{obtener_hora_local()}] {mensaje}")
     estado['historial'] = estado['historial'][:40]
-    guardar_estado(estado)
 
 
 # --- BASE DE DATOS ---
@@ -122,7 +129,6 @@ def obtener_estado():
         try:
             doc = coleccion_estado.find_one({"_id": "estado_actual"})
             if doc:
-                # Estructura segura de mercado_actual para migraciones
                 if "mercado_actual" not in doc:
                     doc["mercado_actual"] = {}
                 for par in PARES_OPERABLES:
@@ -132,7 +138,8 @@ def obtener_estado():
             else:
                 coleccion_estado.insert_one(estado_ram)
                 return estado_ram.copy()
-        except PyMongoError:
+        except PyMongoError as e:
+            print(f"⚠️ Error de lectura en Mongo: {e}", flush=True)
             return estado_ram
     return estado_ram
 
@@ -142,8 +149,8 @@ def guardar_estado(estado):
     if coleccion_estado is not None:
         try:
             coleccion_estado.update_one({"_id": "estado_actual"}, {"$set": estado}, upsert=True)
-        except PyMongoError:
-            pass
+        except PyMongoError as e:
+            print(f"⚠️ Error de escritura en Mongo: {e}", flush=True)
 
 
 # --- LÓGICA DE MERCADO ---
@@ -180,27 +187,49 @@ def obtener_datos_mercado(par):
         return None
 
 
-def simular_operacion(tipo, par, precio, cantidad_usd, atr_actual=0.0):
+def simular_operacion(tipo, par, precio, atr_actual=0.0):
     estado = obtener_estado()
-    fee = cantidad_usd * (FEE_PCT / 100.0)
     
     if tipo == 'COMPRA':
-        estado['saldo_usd'] -= cantidad_usd
-        cantidad_moneda = (cantidad_usd - fee) / precio
+        monto_inversion = estado['saldo_usd'] * PORCENTAJE_CAPITAL
         
+        if monto_inversion < 10.0:
+            registrar_evento_en_estado(estado, f"⚠️ Capital insuficiente para comprar {par} (Mínimo: 10 USD)")
+            guardar_estado(estado)
+            return
+
+        fee = monto_inversion * (FEE_PCT / 100.0)
+        cantidad_moneda = (monto_inversion - fee) / precio
+        
+        estado['saldo_usd'] -= monto_inversion
         estado['en_posicion'] = True
         estado['par_activo'] = par
         estado['cantidad_activa'] = cantidad_moneda
-        estado['capital_invertido_usd'] = cantidad_usd
+        estado['capital_invertido_usd'] = monto_inversion
         estado['precio_compra'] = precio
         
         estado['precio_max_alcanzado'] = precio
-        # Stop Loss Dinámico Inicial basado en la volatilidad real del activo (ATR)
         estado['stop_dinamico'] = precio - (atr_actual * ATR_MULTIPLIER_STOP)
         
-        registrar_evento(f"🟢 COMPRA {par} | P: {precio:.2f} | Inversión: {cantidad_usd:.2f} | Stop Inicial: {estado['stop_dinamico']:.2f}")
+        registrar_evento_en_estado(
+            estado, 
+            f"🟢 COMPRA {par} | P: {precio:.2f} | Inversión: {monto_inversion:.2f} USD (25%) | Stop: {estado['stop_dinamico']:.2f}"
+        )
         
     elif tipo in ['VENTA_STOP', 'VENTA_PROFIT', 'VENTA_TRAILING']:
+        # 🛑 GUARDIA DE SEGURIDAD: Evita procesar ventas con datos nulos o corruptos
+        if estado['cantidad_activa'] <= 0 or estado['capital_invertido_usd'] <= 0:
+            registrar_evento_en_estado(estado, f"🚨 Venta nula bloqueada en {par}. Reseteando posición sin modificar saldo.")
+            estado['en_posicion'] = False
+            estado['par_activo'] = ""
+            estado['cantidad_activa'] = 0.0
+            estado['capital_invertido_usd'] = 0.0
+            estado['precio_compra'] = 0.0
+            estado['stop_dinamico'] = 0.0
+            estado['precio_max_alcanzado'] = 0.0
+            guardar_estado(estado)
+            return
+
         valor_bruto_venta = estado['cantidad_activa'] * precio
         fee_venta = valor_bruto_venta * (FEE_PCT / 100.0)
         retorno_neto = valor_bruto_venta - fee_venta
@@ -222,7 +251,10 @@ def simular_operacion(tipo, par, precio, cantidad_usd, atr_actual=0.0):
             estado['gross_loss'] += abs(beneficio_trade)
             icono = "🛑 STOP LOSS" if tipo == 'VENTA_STOP' else "🛡️ TRAILING STOP"
             
-        registrar_evento(f"{icono} {par} | Venta: {precio:.2f} | Retorno: {retorno_neto:.2f} | B/P: {beneficio_trade:.2f} USD")
+        registrar_evento_en_estado(
+            estado, 
+            f"{icono} {par} | Venta: {precio:.2f} | B/P: {beneficio_trade:+.2f} USD | Saldo: ${estado['saldo_usd']:.2f}"
+        )
         
         estado['en_posicion'] = False
         estado['par_activo'] = ""
@@ -258,13 +290,13 @@ def analizar_y_operar():
             nuevo_stop = precio - (atr * ATR_MULTIPLIER_TRAILING)
             if nuevo_stop > estado['stop_dinamico']:
                 estado['stop_dinamico'] = nuevo_stop
-                registrar_evento(f"🔒 Trailing ATR ajustado en {par}: {nuevo_stop:.2f}")
+                registrar_evento_en_estado(estado, f"🔒 Trailing ATR ajustado en {par}: {nuevo_stop:.2f}")
                 guardar_estado(estado)
 
         if precio <= estado['stop_dinamico']:
-            simular_operacion('VENTA_TRAILING' if estado['stop_dinamico'] > estado['precio_compra'] else 'VENTA_STOP', par, precio, 0)
+            simular_operacion('VENTA_TRAILING' if estado['stop_dinamico'] > estado['precio_compra'] else 'VENTA_STOP', par, precio)
         elif precio >= estado['precio_compra'] * (1.0 + TAKE_PROFIT_PCT/100.0):
-            simular_operacion('VENTA_PROFIT', par, precio, 0)
+            simular_operacion('VENTA_PROFIT', par, precio)
              
     else:
         for par in PARES_OPERABLES:
@@ -289,11 +321,11 @@ def analizar_y_operar():
             tendencia_15m = precio > sma_15m
             tendencia_1h = precio > sma_1h
             impulso_rsi = RSI_MIN < rsi < RSI_MAX
-            fuerza_tendencia = adx > ADX_MIN            # El mercado tiene que estar en movimiento claro
-            confirmacion_volumen = precio > vwap        # Dinero institucional respaldando la subida
+            fuerza_tendencia = adx > ADX_MIN
+            confirmacion_volumen = precio > vwap
             
             if tendencia_15m and tendencia_1h and impulso_rsi and fuerza_tendencia and confirmacion_volumen:
-                simular_operacion('COMPRA', par, precio, estado['saldo_usd'], atr)
+                simular_operacion('COMPRA', par, precio, atr)
                 break 
 
 
@@ -418,7 +450,7 @@ class WebDashboardHandler(BaseHTTPRequestHandler):
             
             valor_actual_posicion = estado['cantidad_activa'] * precio_actual
             equidad = estado['saldo_usd'] + valor_actual_posicion
-            pnl = ((precio_actual - estado['precio_compra']) / estado['precio_compra']) * 100
+            pnl = ((precio_actual - estado['precio_compra']) / estado['precio_compra']) * 100 if estado['precio_compra'] > 0 else 0.0
             pnl_class = "text-success" if pnl >= 0 else "text-danger"
             
             pos_html = f"""
@@ -484,7 +516,7 @@ class WebDashboardHandler(BaseHTTPRequestHandler):
             </div>
             """
 
-        historial = "".join([f"<div class='log-line'>{linea}</div>" for linea in estado['historial']])
+        historial = "".join([f"<div class='log-line'>{linea}</div>" for linea in estado.get('historial', [])])
         if not historial: historial = "<div class='log-line'>Sistema inicializado. Analizando mercados...</div>"
 
         html_final = HTML_TEMPLATE.format(
@@ -511,7 +543,7 @@ def iniciar_servidor_web():
 
 
 if __name__ == "__main__":
-    print(f"=== INICIANDO QUANT ENGINE V2 ===", flush=True)
+    print(f"=== INICIANDO QUANT ENGINE V2.1 (FIXED) ===", flush=True)
     threading.Thread(target=iniciar_servidor_web, daemon=True).start()
 
     while True:
