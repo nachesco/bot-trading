@@ -41,6 +41,8 @@ ESTADO_DEFAULT = {
     "precio_compra": 0.0,
     "cantidad_activa": 0.0,
     "stop_dinamico": 0.0,
+    "take_profit": 0.0,
+    "inversion_bruta": 0.0,
     "trades_ganadores": 0,
     "trades_perdedores": 0,
     "balance_history": [1000.0],
@@ -55,7 +57,11 @@ def obtener_estado():
     try:
         doc = state_col.find_one({"_id": "main_state"})
         if doc:
-            return doc["data"]
+            # Asegurar que las nuevas variables existan en estados antiguos
+            data = doc["data"]
+            if "take_profit" not in data: data["take_profit"] = 0.0
+            if "inversion_bruta" not in data: data["inversion_bruta"] = 0.0
+            return data
     except Exception as e:
         print(f"Error al obtener estado de MongoDB: {e}")
     return ESTADO_DEFAULT.copy()
@@ -114,7 +120,6 @@ def calcular_atr(velas, periodo=14):
     return sum(trs[-periodo:]) / periodo if trs else 10.0
 
 def calcular_adx(velas, periodo=14):
-    # Cálculo simplificado de la fuerza tendencial ADX
     if len(velas) < periodo + 1:
         return 20.0
     subidas = 0
@@ -168,6 +173,7 @@ HTML_TEMPLATE = """
         .status-dot {{ height: 14px; width: 14px; border-radius: 50%; display: inline-block; box-shadow: 0 0 10px currentColor; }}
         .dot-active {{ color: var(--success); background: var(--success); }}
         .dot-waiting {{ color: var(--warning); background: var(--warning); }}
+        .grid-5 {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 15px; margin-bottom: 20px; }}
         .grid-4 {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 15px; margin-bottom: 20px; }}
         .grid-3 {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 15px; margin-bottom: 20px; }}
         .card {{ background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; padding: 20px; transition: transform 0.2s; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
@@ -237,7 +243,7 @@ HTML_TEMPLATE = """
         </div>
 
         <div class="section-header">
-            <h2 class="section-title">📡 Matriz de Análisis</h2>
+            <h2 class="section-title">📡 Matriz de Análisis (1H)</h2>
         </div>
         <div class="grid-3">
             {mercado_html}
@@ -352,17 +358,26 @@ class WebDashboardHandler(BaseHTTPRequestHandler):
 
             valor_actual_posicion = estado.get('cantidad_activa', 0.0) * precio_actual
             equidad = estado.get('saldo_usd', 0.0) + valor_actual_posicion
-            pnl = ((precio_actual - precio_compra) / precio_compra) * 100 if precio_compra > 0 else 0.0
+            
+            # P&L basado en la inversión bruta descontando comisiones de entrada
+            inversion_inicial = estado.get("inversion_bruta", precio_compra * estado.get('cantidad_activa', 0.0))
+            if inversion_inicial > 0:
+                pnl_abierto = valor_actual_posicion - inversion_inicial
+                pnl = (pnl_abierto / inversion_inicial) * 100
+            else:
+                pnl = 0.0
+                
             pnl_class = "text-success" if pnl >= 0 else "text-danger"
 
             pos_html = f"""
             <div class="card active-trade" style="margin-bottom: 20px;">
                 <div class="card-title" style="color: var(--success); font-size: 1rem;">🟢 OPERACIÓN ACTIVA: {par}</div>
-                <div class="grid-4" style="margin-bottom: 0;">
-                    <div><span style="color: var(--text-muted); font-size: 0.85rem;">Precio de Compra</span><br><strong>${precio_compra:,.2f}</strong></div>
+                <div class="grid-5" style="margin-bottom: 0;">
+                    <div><span style="color: var(--text-muted); font-size: 0.85rem;">Precio Entrada</span><br><strong>${precio_compra:,.2f}</strong></div>
                     <div><span style="color: var(--text-muted); font-size: 0.85rem;">Precio Actual</span><br><strong>${precio_actual:,.2f}</strong></div>
-                    <div><span style="color: var(--text-muted); font-size: 0.85rem;">P&L Abierto</span><br><strong class="{pnl_class}">{pnl:+.2f}%</strong></div>
-                    <div><span style="color: var(--text-muted); font-size: 0.85rem;">Stop ATR Dinámico</span><br><strong class="text-danger">${estado.get('stop_dinamico', 0.0):,.2f}</strong></div>
+                    <div><span style="color: var(--text-muted); font-size: 0.85rem;">P&L Neto Abierto</span><br><strong class="{pnl_class}">{pnl:+.2f}%</strong></div>
+                    <div><span style="color: var(--text-muted); font-size: 0.85rem;">Stop ATR</span><br><strong class="text-danger">${estado.get('stop_dinamico', 0.0):,.2f}</strong></div>
+                    <div><span style="color: var(--text-muted); font-size: 0.85rem;">Take Profit</span><br><strong class="text-success">${estado.get('take_profit', 0.0):,.2f}</strong></div>
                 </div>
             </div>
             """
@@ -447,7 +462,8 @@ def obtener_datos_kraken(pair_symbol):
     m_map = {"BTC/USD": "XXBTZUSD", "ETH/USD": "XETHZUSD", "SOL/USD": "SOLUSD"}
     symbol = m_map.get(pair_symbol, "XXBTZUSD")
     try:
-        url = f"https://api.kraken.com/0/public/OHLC?pair={symbol}&interval=15"
+        # MEJORA: Cambio a temporalidad de 1H (interval=60) para mitigar el impacto de las comisiones en tendencias cortas
+        url = f"https://api.kraken.com/0/public/OHLC?pair={symbol}&interval=60"
         res = requests.get(url, timeout=5).json()
         if res.get("error"):
             return None
@@ -469,13 +485,16 @@ def obtener_datos_kraken(pair_symbol):
         return None
 
 def ejecutar_bucle_quant():
-    print("=== INICIANDO QUANT ENGINE V2.1 (FIXED & IMPROVED) ===")
+    print("=== INICIANDO QUANT ENGINE V2.2 (KRAKEN COMMISSIONS & 1H TF) ===")
     
     # Inicialización de estado en BD si no existe
     estado = obtener_estado()
     if "balance_history" not in estado:
         estado["balance_history"] = [estado.get("saldo_usd", 1000.0)]
     guardar_estado(estado)
+
+    # Comisión base de Kraken Taker (0.26%)
+    COMISION_KRAKEN = 0.0026
 
     while True:
         try:
@@ -487,12 +506,15 @@ def ejecutar_bucle_quant():
                 if not velas or len(velas) < 15:
                     continue
 
-                precios = [v['close'] for v in velas]
-                precio_actual = precios[-1]
+                # MEJORA: Se excluye la vela actual en formación (velas[:-1]) para evitar señales falsas
+                velas_cerradas = velas[:-1] 
+                precios = [v['close'] for v in velas_cerradas]
+                precio_actual = velas[-1]['close'] # Precio en tiempo real para evaluar salidas y entradas
+
                 rsi = calcular_rsi(precios)
-                atr = calcular_atr(velas)
-                adx = calcular_adx(velas)
-                vwap = calcular_vwap(velas)
+                atr = calcular_atr(velas_cerradas)
+                adx = calcular_adx(velas_cerradas)
+                vwap = calcular_vwap(velas_cerradas)
 
                 mercado[par] = {
                     "precio": precio_actual,
@@ -505,13 +527,25 @@ def ejecutar_bucle_quant():
                 # GESTIÓN DE POSICIÓN ABIERTA
                 if estado.get("en_posicion") and estado.get("par_activo") == par:
                     precio_compra = estado["precio_compra"]
+                    
+                    # Trailing Stop: el stop sube si el precio sube, nunca baja
                     nuevo_stop = max(estado["stop_dinamico"], precio_actual - (1.5 * atr))
                     estado["stop_dinamico"] = nuevo_stop
+                    
+                    take_profit_activo = estado.get("take_profit", precio_compra * 1.5)
 
-                    # Condición de Salida (Stop Loss o Trailing Stop)
-                    if precio_actual <= estado["stop_dinamico"]:
-                        monto_recuperado = estado["cantidad_activa"] * precio_actual
-                        pnl_usd = monto_recuperado - (estado["cantidad_activa"] * precio_compra)
+                    # Condición de Salida: Stop Loss (Trailing) o Take Profit alcanzado
+                    if precio_actual <= estado["stop_dinamico"] or precio_actual >= take_profit_activo:
+                        razon = "TAKE PROFIT" if precio_actual >= take_profit_activo else "STOP/TRAILING"
+                        
+                        # Cálculo de venta deduciendo comisiones
+                        monto_bruto = estado["cantidad_activa"] * precio_actual
+                        comision_venta = monto_bruto * COMISION_KRAKEN
+                        monto_recuperado = monto_bruto - comision_venta
+                        
+                        # PnL exacto comparando inversión bruta y retorno neto
+                        inversion_inicial = estado.get("inversion_bruta", estado["cantidad_activa"] * precio_compra)
+                        pnl_usd = monto_recuperado - inversion_inicial
                         
                         estado["saldo_usd"] += monto_recuperado
                         estado["en_posicion"] = False
@@ -524,26 +558,34 @@ def ejecutar_bucle_quant():
 
                         estado.setdefault("balance_history", []).append(round(estado["saldo_usd"], 2))
                         
-                        msg = f"🔴 VENTA EJECUTADA [{par}] a ${precio_actual:,.2f} | PnL: ${pnl_usd:+.2f} | Nuevo Saldo: ${estado['saldo_usd']:,.2f}"
+                        msg = f"🔴 VENTA EJECUTADA ({razon}) [{par}] a ${precio_actual:,.2f} | PnL Neto: ${pnl_usd:+.2f} | Nuevo Saldo: ${estado['saldo_usd']:,.2f}"
                         registrar_evento_en_estado(estado, msg)
                         print(f"[{obtener_hora_local()}] {msg}")
 
                 # GESTIÓN DE ENTRADA (ESTRATEGIA CUANTITATIVA AL 25%)
                 elif not estado.get("en_posicion"):
-                    # Filtros estrictos: Tendencia (Precio > VWAP), Fuerza (ADX > 25), Momentum (RSI entre 50 y 65)
-                    if precio_actual > vwap and adx > 25.0 and 50.0 <= rsi <= 65.0:
+                    # Filtros estrictos ajustados: Tendencia, Fuerza (ADX > 25), Momentum (RSI > 50 quitando techo para no perder pumps)
+                    if precio_actual > vwap and adx > 25.0 and rsi >= 50.0:
                         capital_a_invertir = estado["saldo_usd"] * 0.25 # Gestión de capital al 25%
                         
                         if capital_a_invertir >= 10.0:
-                            cantidad = capital_a_invertir / precio_actual
+                            # Cálculo de compra descontando comisión de Kraken
+                            comision_compra = capital_a_invertir * COMISION_KRAKEN
+                            capital_efectivo = capital_a_invertir - comision_compra
+                            cantidad = capital_efectivo / precio_actual
+                            
                             estado["saldo_usd"] -= capital_a_invertir
                             estado["en_posicion"] = True
                             estado["par_activo"] = par
                             estado["precio_compra"] = precio_actual
                             estado["cantidad_activa"] = cantidad
+                            
+                            # Establecemos Stop Loss y un objetivo de Take Profit estático a +3 veces la volatilidad
                             estado["stop_dinamico"] = precio_actual - (1.5 * atr)
+                            estado["take_profit"] = precio_actual + (3.0 * atr)
+                            estado["inversion_bruta"] = capital_a_invertir
 
-                            msg = f"🟢 COMPRA EJECUTADA [{par}] a ${precio_actual:,.2f} | Invertido: ${capital_a_invertir:,.2f} (25%) | Stop Inicial: ${estado['stop_dinamico']:,.2f}"
+                            msg = f"🟢 COMPRA EJECUTADA [{par}] a ${precio_actual:,.2f} | Invertido: ${capital_a_invertir:,.2f} | TP: ${estado['take_profit']:,.2f} | SL: ${estado['stop_dinamico']:,.2f}"
                             registrar_evento_en_estado(estado, msg)
                             print(f"[{obtener_hora_local()}] {msg}")
 
